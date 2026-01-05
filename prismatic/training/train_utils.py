@@ -100,12 +100,16 @@ def compute_weighted_l1_loss(
     else:
         raise ValueError(f"不支持的权重策略: {weight_strategy}")
 
-    # 3. 权重裁剪：归一化前先限制最大值，避免个别样本权重过大
+    # 3.1 权重裁剪：归一化前先限制最大值，避免个别样本权重过大
     weights = torch.clamp(weights, max=clip_max_weight)
+
+    # 3.2 权重裁剪：限制最小值，避免过小权重影响训练
+    min_weight = 1.0 / clip_max_weight
+    weights = torch.clamp(weights, min=min_weight)
 
     # 4. 权重归一化：确保平均权重为1，稳定训练尺度(可选，视情况使用，如果训练不稳定可启用)
     if normalize_weights:
-        weights = weights / torch.mean(weights)
+        weights = weights / clip_max_weight * 2.0 # 归一化到平均值约为1
 
     # 5. 计算加权损失（对所有7维动作应用相同权重）
     l1_errors = torch.abs(ground_truth_actions - predicted_actions)

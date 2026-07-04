@@ -24,7 +24,7 @@ json_numpy.patch()
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
+from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, VisionActionHead
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import NoisyActionProjector, ProprioProjector
 from prismatic.vla.constants import (
@@ -461,7 +461,7 @@ def get_noisy_action_projector(cfg: Any, llm_dim: int) -> NoisyActionProjector:
     return noisy_action_projector
 
 
-def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, DiffusionActionHead]:
+def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, DiffusionActionHead, VisionActionHead]:
     """
     Get action head for continuous value prediction.
 
@@ -470,7 +470,7 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
         llm_dim: Dimension of the language model
 
     Returns:
-        Union[L1RegressionActionHead, DiffusionActionHead]: The initialized action head
+        Union[L1RegressionActionHead, DiffusionActionHead, VisionActionHead]: The initialized action head
 
     Raises:
         AssertionError: If both L1 regression and diffusion are specified
@@ -479,7 +479,17 @@ def get_action_head(cfg: Any, llm_dim: int) -> Union[L1RegressionActionHead, Dif
 
     # Initialize appropriate action head based on configuration
     if cfg.use_l1_regression:
-        action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
+        if getattr(cfg, "use_vision_action_head", False):
+            action_head = VisionActionHead(
+                input_dim=llm_dim,
+                hidden_dim=llm_dim,
+                action_dim=ACTION_DIM,
+                vision_encoder_name=getattr(cfg, "action_head_vision_encoder", "siglip-base"),
+                freeze_vision_encoder=getattr(cfg, "freeze_action_head_vision", True),
+                num_views=getattr(cfg, "action_head_num_views", 2),
+            )
+        else:
+            action_head = L1RegressionActionHead(input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM)
     elif cfg.use_diffusion:
         action_head = DiffusionActionHead(
             input_dim=llm_dim, hidden_dim=llm_dim, action_dim=ACTION_DIM, num_diffusion_steps_train=cfg.num_diffusion_steps_train
@@ -712,6 +722,43 @@ def prepare_images_for_vla(images: List[np.ndarray], cfg: Any) -> List[Image.Ima
     return processed_images
 
 
+def get_pixel_values_from_images(
+    images: List[np.ndarray],
+    cfg: Any,
+    processor: Any,
+    task_label: str,
+) -> torch.Tensor:
+    """
+    Process raw images into VLA pixel_values tensor.
+
+    Same processing pipeline as get_vla_action, but only returns pixel_values
+    (useful for building frame history for delay simulation).
+
+    Args:
+        images: List of raw images as numpy arrays [primary, wrist1, ...]
+        cfg: Configuration object
+        processor: VLA processor
+        task_label: Task description string
+
+    Returns:
+        pixel_values tensor ready for VLA input
+    """
+    processed_images = prepare_images_for_vla(images, cfg)
+    primary_image = processed_images.pop(0)
+    prompt = f"In: What action should the robot take to {task_label.lower()}?\nOut:"
+    inputs = processor(prompt, primary_image).to(DEVICE, dtype=torch.bfloat16)
+
+    if processed_images:
+        all_wrist_inputs = [
+            processor(prompt, img_wrist).to(DEVICE, dtype=torch.bfloat16) for img_wrist in processed_images
+        ]
+        primary_pv = inputs["pixel_values"]
+        wrist_pvs = [w["pixel_values"] for w in all_wrist_inputs]
+        inputs["pixel_values"] = torch.cat([primary_pv] + wrist_pvs, dim=1)
+
+    return inputs["pixel_values"]
+
+
 def get_vla_action(
     cfg: Any,
     vla: torch.nn.Module,
@@ -722,6 +769,8 @@ def get_vla_action(
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
+    pixel_values_for_action_head: Optional[torch.Tensor] = None,
+    pixel_values_for_vla: Optional[torch.Tensor] = None,
 ) -> List[np.ndarray]:
     """
     Generate action predictions with the VLA policy.
@@ -736,6 +785,12 @@ def get_vla_action(
         proprio_projector: Optional proprioception projector
         noisy_action_projector: Optional noisy action projector for diffusion
         use_film: Whether to use FiLM
+        pixel_values_for_action_head: If provided, VisionActionHead uses these pixel_values
+            instead of the ones used by VLA (for frame delay eval: VLA sees delayed frame,
+            action head sees current frame)
+        pixel_values_for_vla: If provided, use these pixel_values for the VLA's own forward
+            pass instead of processing obs images (for frame delay eval: pass delayed
+            pixel_values here, and current pixel_values via pixel_values_for_action_head)
 
     Returns:
         List[np.ndarray]: Predicted actions
@@ -777,6 +832,10 @@ def get_vla_action(
             obs["state"] = normalize_proprio(proprio, proprio_norm_stats)
             proprio = obs["state"]
 
+        # Override pixel_values for VLA if delayed frame is provided (frame delay eval)
+        if pixel_values_for_vla is not None:
+            inputs["pixel_values"] = pixel_values_for_vla
+
         # Generate action
         if action_head is None:
             # Standard VLA output (single-image inputs, discrete actions)
@@ -792,6 +851,7 @@ def get_vla_action(
                 noisy_action_projector=noisy_action_projector,
                 action_head=action_head,
                 use_film=use_film,
+                pixel_values_for_action_head=pixel_values_for_action_head,
             )
 
     # Return action chunk as list of actions

@@ -884,6 +884,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         NUM_PATCHES,
         NUM_PROMPT_TOKENS,
         action_head=None,
+        pixel_values_for_action_head=None,
     ):
         """Run L1 regression-based continuous action prediction or discrete action tokens prediction."""
         # Zero out action token embeddings
@@ -920,7 +921,11 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         # Handle different prediction methods
         if action_head is not None:
             # L1 regression prediction
-            normalized_actions = action_head.predict_action(actions_hidden_states)
+            # VisionActionHead needs pixel_values for its own vision encoder
+            if pixel_values_for_action_head is not None and hasattr(action_head, "vision_encoder"):
+                normalized_actions = action_head.predict_action(actions_hidden_states, pixel_values=pixel_values_for_action_head)
+            else:
+                normalized_actions = action_head.predict_action(actions_hidden_states)
             normalized_actions = normalized_actions.reshape(NUM_ACTIONS_CHUNK, ACTION_DIM)
             normalized_actions = normalized_actions.float().cpu().detach().numpy()
         else:
@@ -950,6 +955,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
         action_head=None,
         noisy_action_projector=None,
         use_film: bool = False,
+        pixel_values_for_action_head=None,
         **kwargs: str,
     ) -> np.ndarray:
         """Predict actions from input sequence, with options for different prediction methods.
@@ -1041,6 +1047,9 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
             )
         else:
             # Run regression or discrete token-based prediction
+            # Use separate pixel_values for action head if provided (frame delay eval),
+            # otherwise fall back to the same pixel_values used by VLA
+            _pv_for_ah = pixel_values_for_action_head if pixel_values_for_action_head is not None else pixel_values
             normalized_actions, actions_hidden_states = self._regression_or_discrete_prediction(
                 input_embeddings,
                 all_actions_mask,
@@ -1050,6 +1059,7 @@ class OpenVLAForActionPrediction(PrismaticForConditionalGeneration):
                 NUM_PATCHES,
                 NUM_PROMPT_TOKENS,
                 action_head,
+                pixel_values_for_action_head=_pv_for_ah,
             )
 
         # Unnormalize predicted actions

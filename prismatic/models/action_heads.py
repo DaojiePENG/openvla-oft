@@ -1,8 +1,10 @@
 """Implementations of various action heads, which serve as alternatives to VLM sequential token prediction."""
 
 import math
+from typing import Optional
 
 import numpy as np
+import timm
 import torch
 import torch.nn as nn
 from diffusers.schedulers.scheduling_ddim import DDIMScheduler
@@ -209,3 +211,199 @@ class DiffusionActionHead(nn.Module):
         # Get diffusion model's noise prediction.
         noise_pred = self.noise_predictor(rearranged_actions_hidden_states)
         return noise_pred
+
+
+# SigLIP model options for the VisionActionHead's vision encoder
+SIGLIP_MODELS = {
+    "siglip-base": "vit_base_patch16_siglip_224",
+    "siglip-so400m": "vit_so400m_patch14_siglip_224",
+}
+
+
+class VisionEncoder(nn.Module):
+    """
+    Lightweight vision encoder for the VisionActionHead's real-time visual sensing.
+    Uses SigLIP (frozen by default) to extract visual features from real-time images.
+    """
+
+    def __init__(
+        self,
+        model_name: str = "siglip-base",
+        freeze: bool = True,
+        num_views: int = 2,  # primary + wrist
+    ):
+        super().__init__()
+        self.num_views = num_views
+
+        # Load SigLIP model from timm
+        timm_model_name = SIGLIP_MODELS.get(model_name, model_name)
+        self.vit = timm.create_model(timm_model_name, pretrained=True, num_classes=0)
+
+        # Get embedding dimension
+        self.embed_dim = self.vit.embed_dim  # typically 768 for base, 1152 for so400m
+
+        # Freeze vision encoder by default
+        if freeze:
+            for param in self.vit.parameters():
+                param.requires_grad = False
+            self.vit.eval()
+
+    def forward(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        Process real-time images and return pooled visual features.
+
+        The input may come from:
+        1. VLA processor: (B, num_views * 6, H, W) where 6 = 3 SigLIP + 3 DINOv2 channels per view
+        2. Raw RGB: (B, num_views * 3, H, W) or (B, num_views, 3, H, W)
+
+        We extract only the first 3 channels per view (SigLIP channels) for our own SigLIP encoder.
+
+        Returns:
+            vision_features: (B, num_views * embed_dim) pooled features
+        """
+        B = pixel_values.shape[0]
+
+        # Handle 5D input: (B, num_views, C, H, W)
+        if pixel_values.dim() == 5:
+            V = pixel_values.shape[1]
+            C = pixel_values.shape[2]
+            # Take first 3 channels per view (SigLIP channels)
+            pixel_values = pixel_values[:, :, :3, :, :]  # (B, V, 3, H, W)
+            pixel_values = pixel_values.reshape(B * V, 3, pixel_values.shape[-2], pixel_values.shape[-1])
+        else:
+            # 4D input: (B, num_views * C, H, W)
+            total_channels = pixel_values.shape[1]
+            H, W = pixel_values.shape[2], pixel_values.shape[3]
+            channels_per_view = total_channels // self.num_views
+
+            if channels_per_view > 3:
+                # VLA format: 6 channels per view (3 SigLIP + 3 DINOv2)
+                # Reshape to (B, num_views, channels_per_view, H, W) and extract first 3
+                pixel_values = pixel_values.reshape(B, self.num_views, channels_per_view, H, W)
+                pixel_values = pixel_values[:, :, :3, :, :]  # (B, num_views, 3, H, W)
+                pixel_values = pixel_values.reshape(B * self.num_views, 3, H, W)
+            else:
+                # Already 3 channels per view: (B, num_views * 3, H, W)
+                pixel_values = pixel_values.reshape(B * self.num_views, 3, H, W)
+
+        # Cast input to match vision encoder weight dtype (e.g., bfloat16)
+        target_dtype = next(self.vit.parameters()).dtype
+        pixel_values = pixel_values.to(target_dtype)
+
+        # Extract features
+        features = self.vit(pixel_values)  # (B*V, embed_dim)
+
+        # Reshape to (B, V * embed_dim)
+        features = features.reshape(B, self.num_views * self.embed_dim)
+
+        return features
+
+
+class VisionActionHead(nn.Module):
+    """
+    Dual-system ActionHead that combines:
+    1. LLM hidden states — high-level planning (potentially stale from delayed frames)
+    2. Real-time vision features (from own vision encoder) — fast reactive control
+
+    During frame-delay training:
+    - Fresh path: h_fresh from current frame + current vision → action_fresh
+    - Stale path: h_stale from delayed frame + current vision → action_stale
+    - Both are trained toward ground-truth actions.
+
+    Uses its own frozen SigLIP encoder (same pretrained weights as VLA's base SigLIP).
+    At deployment, copy the VLA's base SigLIP weights (without FiLM/LoRA) here.
+    """
+
+    def __init__(
+        self,
+        input_dim: int = 4096,  # LLM hidden dimension
+        hidden_dim: int = 4096,
+        action_dim: int = 7,
+        vision_encoder_name: str = "siglip-base",
+        freeze_vision_encoder: bool = True,
+        num_views: int = 2,  # primary + wrist
+    ):
+        super().__init__()
+        self.action_dim = action_dim
+        self.num_views = num_views
+
+        # Vision encoder for real-time visual sensing
+        self.vision_encoder = VisionEncoder(
+            model_name=vision_encoder_name,
+            freeze=freeze_vision_encoder,
+            num_views=num_views,
+        )
+        vision_embed_dim = self.vision_encoder.embed_dim * num_views
+
+        # Project vision features to match LLM dimension
+        self.vision_projector = nn.Sequential(
+            nn.Linear(vision_embed_dim, input_dim),
+            nn.GELU(),
+        )
+
+        # Fusion MLP: combines LLM hidden states + projected vision features
+        fusion_input_dim = input_dim * 2  # LLM + vision concatenated
+
+        self.fusion_mlp = MLPResNet(
+            num_blocks=2,
+            input_dim=fusion_input_dim,
+            hidden_dim=hidden_dim,
+            output_dim=action_dim,
+        )
+
+    def encode_vision(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """
+        Process real-time images through the vision encoder.
+
+        Args:
+            pixel_values: (B, num_views * C, H, W) or (B, num_views, C, H, W)
+
+        Returns:
+            vision_features: (B, vision_embed_dim) pooled features
+        """
+        return self.vision_encoder(pixel_values)
+
+    def predict_action(
+        self,
+        llm_hidden_states: torch.Tensor,
+        pixel_values: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Predict actions using LLM hidden states and real-time vision.
+
+        Args:
+            llm_hidden_states: (B, chunk_len * action_dim, hidden_dim)
+                              Hidden states from LLM (potentially from delayed frame)
+            pixel_values: (B, num_views * C, H, W) or (B, num_views, C, H, W)
+                         Real-time images for the ActionHead's vision encoder
+
+        Returns:
+            actions: (B, chunk_len, action_dim) predicted actions
+        """
+        batch_size = llm_hidden_states.shape[0]
+        device = llm_hidden_states.device
+
+        # Mean-pool LLM hidden states over action tokens per chunk position
+        # (B, chunk_len * action_dim, hidden_dim) -> (B, chunk_len, action_dim, hidden_dim) -> mean over action_dim -> (B, chunk_len, hidden_dim)
+        llm_features = llm_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, ACTION_DIM, -1).mean(dim=2)
+
+        if pixel_values is not None:
+            # Encode real-time vision
+            vision_features = self.encode_vision(pixel_values)  # (B, vision_embed_dim)
+
+            # Project vision features to LLM dimension
+            vision_proj = self.vision_projector(vision_features)  # (B, input_dim)
+
+            # Tile vision features to match chunk length
+            vision_proj = vision_proj.unsqueeze(1).expand(-1, NUM_ACTIONS_CHUNK, -1)  # (B, chunk_len, input_dim)
+
+            # Concatenate LLM and vision features
+            fused = torch.cat([llm_features, vision_proj], dim=-1)  # (B, chunk_len, input_dim * 2)
+        else:
+            # No vision input — pad with zeros (fallback mode)
+            zeros = torch.zeros_like(llm_features)
+            fused = torch.cat([llm_features, zeros], dim=-1)
+
+        # Predict actions
+        actions = self.fusion_mlp(fused)  # (B, chunk_len, action_dim)
+        return actions

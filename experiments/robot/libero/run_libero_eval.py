@@ -34,6 +34,7 @@ from experiments.robot.libero.libero_utils import (
 from experiments.robot.openvla_utils import (
     get_action_head,
     get_noisy_action_projector,
+    get_pixel_values_from_images,
     get_processor,
     get_proprio_projector,
     resize_image_for_policy,
@@ -100,6 +101,16 @@ class GenerateConfig:
     num_open_loop_steps: int = 8                     # Number of actions to execute open-loop before requerying policy
 
     lora_rank: int = 32                              # Rank of LoRA weight matrix (MAKE SURE THIS MATCHES TRAINING!)
+
+    # VisionActionHead + Frame Delay (must match training config)
+    use_vision_action_head: bool = False             # If True, uses VisionActionHead
+    action_head_vision_encoder: str = "siglip-base"  # Vision encoder for ActionHead
+    freeze_action_head_vision: bool = True           # If True, freezes ActionHead's vision encoder
+    action_head_num_views: int = 2                   # Number of camera views
+
+    # Frame delay evaluation: simulate async deployment (cloud VLA delayed, local action head real-time)
+    use_frame_delay_eval: bool = False               # If True, feeds delayed frames to VLA during eval
+    max_delay_steps_eval: int = 10                   # Maximum frame delay (in env steps) for eval
 
     unnorm_key: Union[str, Path] = ""                # Action un-normalization key
 
@@ -305,6 +316,10 @@ def run_episode(
                "both speed and success rate), we recommend executing the full action chunk.")
     action_queue = deque(maxlen=cfg.num_open_loop_steps)
 
+    # Frame delay eval: maintain history of pixel_values for delay simulation
+    use_frame_delay = cfg.use_frame_delay_eval and cfg.use_vision_action_head
+    frame_pv_history = deque(maxlen=cfg.max_delay_steps_eval + 1) if use_frame_delay else None
+
     # Setup
     t = 0
     replay_images = []
@@ -326,18 +341,64 @@ def run_episode(
 
             # If action queue is empty, requery model
             if len(action_queue) == 0:
-                # Query model to get action
-                actions = get_action(
-                    cfg,
-                    model,
-                    observation,
-                    task_description,
-                    processor=processor,
-                    action_head=action_head,
-                    proprio_projector=proprio_projector,
-                    noisy_action_projector=noisy_action_projector,
-                    use_film=cfg.use_film,
-                )
+                if use_frame_delay:
+                    # --- Frame delay eval: VLA processes delayed frame, action head gets current frame ---
+                    # Collect all images from current observation
+                    all_images = [observation["full_image"]]
+                    if cfg.num_images_in_input > 1:
+                        all_images.extend([observation[k] for k in observation.keys() if "wrist" in k])
+
+                    # Process current frame into pixel_values and store in history
+                    current_pv = get_pixel_values_from_images(all_images, cfg, processor, task_description)
+                    frame_pv_history.append(current_pv)
+
+                    if len(frame_pv_history) > 1:
+                        # Sample a random delayed pixel_values from history
+                        max_delay = min(cfg.max_delay_steps_eval, len(frame_pv_history) - 1)
+                        delay_k = np.random.randint(1, max_delay + 1)
+                        delayed_pv_idx = max(0, len(frame_pv_history) - 1 - delay_k)
+                        delayed_pv = frame_pv_history[delayed_pv_idx]
+
+                        # VLA uses delayed frame, action head uses current frame
+                        actions = get_action(
+                            cfg,
+                            model,
+                            observation,
+                            task_description,
+                            processor=processor,
+                            action_head=action_head,
+                            proprio_projector=proprio_projector,
+                            noisy_action_projector=noisy_action_projector,
+                            use_film=cfg.use_film,
+                            pixel_values_for_action_head=current_pv,
+                            pixel_values_for_vla=delayed_pv,
+                        )
+                    else:
+                        # Not enough history yet — use current frame for both
+                        actions = get_action(
+                            cfg,
+                            model,
+                            observation,
+                            task_description,
+                            processor=processor,
+                            action_head=action_head,
+                            proprio_projector=proprio_projector,
+                            noisy_action_projector=noisy_action_projector,
+                            use_film=cfg.use_film,
+                        )
+                else:
+                    # --- Normal eval: no frame delay ---
+                    actions = get_action(
+                        cfg,
+                        model,
+                        observation,
+                        task_description,
+                        processor=processor,
+                        action_head=action_head,
+                        proprio_projector=proprio_projector,
+                        noisy_action_projector=noisy_action_projector,
+                        use_film=cfg.use_film,
+                    )
                 action_queue.extend(actions)
 
             # Get action from queue

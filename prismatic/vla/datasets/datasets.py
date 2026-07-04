@@ -32,11 +32,16 @@ class RLDSBatchTransform:
     predict_stop_token: bool = True
     use_wrist_image: bool = False
     use_proprio: bool = False
+    use_frame_delay: bool = False                   # If True, also extract a delayed frame from the window
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
         dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
-        img = Image.fromarray(rlds_batch["observation"]["image_primary"][0])
+        # With window_size=1, image_primary shape is (1, H, W, C); [0] is the current frame.
+        # With window_size>1, image_primary shape is (window_size, H, W, C);
+        #   index -1 is the current frame, indices 0..-2 are past frames.
+        all_window_frames = rlds_batch["observation"]["image_primary"]
+        img = Image.fromarray(all_window_frames[-1])  # current frame is always the last in window
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
         actions = rlds_batch["action"]
 
@@ -75,17 +80,40 @@ class RLDSBatchTransform:
 
         return_dict = dict(pixel_values=pixel_values, input_ids=input_ids, labels=labels, dataset_name=dataset_name, actions=actions)
 
+        # --- Frame delay: extract a random delayed frame from the same episode window ---
+        if self.use_frame_delay and len(all_window_frames) > 1:
+            # Pick a random past frame from the window (not the current one)
+            num_past = len(all_window_frames) - 1
+            delay_idx = np.random.randint(0, num_past)  # index into past frames
+            delayed_img = Image.fromarray(all_window_frames[delay_idx])
+            delayed_pv = self.image_transform(delayed_img)
+
+            # Collect delayed wrist images and concatenate with delayed primary
+            if self.use_wrist_image:
+                all_delayed_wrist_pv = []
+                for k in rlds_batch["observation"].keys():
+                    if "wrist" in k:
+                        wrist_window = rlds_batch["observation"][k]
+                        delayed_wrist_img = Image.fromarray(wrist_window[delay_idx])
+                        all_delayed_wrist_pv.append(self.image_transform(delayed_wrist_img))
+                return_dict["delayed_pixel_values"] = torch.cat([delayed_pv] + all_delayed_wrist_pv, dim=0)
+            else:
+                return_dict["delayed_pixel_values"] = delayed_pv
+
         # Add additional inputs
         if self.use_wrist_image:
             all_wrist_pixels = []
             for k in rlds_batch["observation"].keys():
                 if "wrist" in k:
-                    img_wrist = Image.fromarray(rlds_batch["observation"][k][0])
+                    img_wrist = Image.fromarray(rlds_batch["observation"][k][-1])  # current frame
                     pixel_values_wrist = self.image_transform(img_wrist)
                     all_wrist_pixels.append(pixel_values_wrist)
             return_dict["pixel_values_wrist"] = torch.cat(all_wrist_pixels, dim=0)
         if self.use_proprio and "proprio" in rlds_batch["observation"]:
             proprio = rlds_batch["observation"]["proprio"]
+            # With window_size > 1, proprio has shape (window_size, proprio_dim); take current frame
+            if len(proprio.shape) > 1:
+                proprio = proprio[-1]
             return_dict["proprio"] = proprio
 
         return return_dict
@@ -101,6 +129,7 @@ class RLDSDataset(IterableDataset):
         shuffle_buffer_size: int = 256_000,
         train: bool = True,
         image_aug: bool = False,
+        window_size: int = 1,
     ) -> None:
         """Lightweight wrapper around RLDS TFDS Pipeline for use with PyTorch/OpenVLA Data Loaders."""
         self.data_root_dir, self.data_mix, self.batch_transform = data_root_dir, data_mix, batch_transform
@@ -129,7 +158,7 @@ class RLDSDataset(IterableDataset):
         )
         rlds_config = dict(
             traj_transform_kwargs=dict(
-                window_size=1,                                      # If we wanted to feed / predict more than one step
+                window_size=window_size,                            # Window size for frame history (1 = no history)
                 future_action_window_size=NUM_ACTIONS_CHUNK-1,      # For action chunking
                 skip_unlabeled=True,                                # Skip trajectories without language labels
                 goal_relabeling_strategy="uniform",                 # Goals are currently unused

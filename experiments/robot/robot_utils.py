@@ -106,6 +106,8 @@ def get_action(
     proprio_projector: Optional[torch.nn.Module] = None,
     noisy_action_projector: Optional[torch.nn.Module] = None,
     use_film: bool = False,
+    pixel_values_for_action_head: Optional[Any] = None,
+    pixel_values_for_vla: Optional[Any] = None,
 ) -> Union[List[np.ndarray], np.ndarray]:
     """
     Query the model to get action predictions.
@@ -120,6 +122,7 @@ def get_action(
         proprio_projector: Optional proprioception projector
         noisy_action_projector: Optional noisy action projector for diffusion
         use_film: Whether to use FiLM
+        pixel_values_for_action_head: Optional separate pixel_values for VisionActionHead (frame delay eval)
 
     Returns:
         Union[List[np.ndarray], np.ndarray]: Predicted actions
@@ -139,6 +142,8 @@ def get_action(
                 proprio_projector=proprio_projector,
                 noisy_action_projector=noisy_action_projector,
                 use_film=use_film,
+                pixel_values_for_action_head=pixel_values_for_action_head,
+                pixel_values_for_vla=pixel_values_for_vla,
             )
         else:
             raise ValueError(f"Unsupported model family: {cfg.model_family}")

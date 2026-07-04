@@ -37,7 +37,7 @@ from experiments.robot.openvla_utils import (
 from prismatic.extern.hf.configuration_prismatic import OpenVLAConfig
 from prismatic.extern.hf.modeling_prismatic import OpenVLAForActionPrediction
 from prismatic.extern.hf.processing_prismatic import PrismaticImageProcessor, PrismaticProcessor
-from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead
+from prismatic.models.action_heads import DiffusionActionHead, L1RegressionActionHead, VisionActionHead
 from prismatic.models.backbones.llm.prompting import PurePromptBuilder
 from prismatic.models.film_vit_wrapper import FiLMedPrismaticVisionBackbone
 from prismatic.models.projectors import (
@@ -101,6 +101,14 @@ class FinetuneConfig:
     resume_step: Optional[int] = None                # (When `resume==True`) Step number that we are resuming from
     image_aug: bool = True                           # If True, trains with image augmentations (HIGHLY RECOMMENDED)
     diffusion_sample_freq: int = 50                  # (When `use_diffusion==True`) Frequency for sampling in steps
+
+    # Frame Delay + VisionActionHead (async deployment: cloud VLA delayed, local action head real-time)
+    use_frame_delay: bool = False                    # If True, VLA receives both delayed and current frames each step
+    window_size: int = 1                             # RLDS window size; set >1 for frame delay (e.g. max_delay+1)
+    use_vision_action_head: bool = False             # If True, uses VisionActionHead with real-time vision input
+    action_head_vision_encoder: str = "siglip-base"  # Vision encoder for ActionHead: "siglip-base" or "siglip-so400m"
+    freeze_action_head_vision: bool = True           # If True, freezes ActionHead's vision encoder
+    action_head_num_views: int = 2                   # Number of image views for ActionHead vision encoder
 
     # LoRA
     use_lora: bool = True                            # If True, uses LoRA fine-tuning
@@ -281,6 +289,7 @@ def run_forward_pass(
     num_patches,
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
+    use_vision_action_head=False,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -323,12 +332,25 @@ def run_forward_pass(
     else:
         noise, noisy_actions, diffusion_timestep_embeddings = None, None, None
 
-    # VLA forward pass
+    # --- Frame Delay: simulate network latency for async dual-system deployment ---
+    # Delayed frames come from the dataset's window mechanism (same episode, guaranteed).
+    # When "delayed_pixel_values" is in the batch, we run VLA on both delayed and current frames:
+    #   - delayed frame → stale hidden states (simulates cloud VLA processing old frame)
+    #   - current frame → fresh hidden states
+    # Both are passed to VisionActionHead with current vision, producing two action predictions.
+    # Loss = L1(action_fresh, gt) + L1(action_stale, gt)
+    # This teaches VisionActionHead to correct stale latents using real-time vision.
+    current_pixel_values = batch["pixel_values"].to(torch.bfloat16).to(device_id)
+    delayed_pixel_values = None
+    if "delayed_pixel_values" in batch and use_vision_action_head:
+        delayed_pixel_values = batch["delayed_pixel_values"].to(torch.bfloat16).to(device_id)
+
+    # --- VLA forward pass on current frame (always) ---
     with torch.autocast("cuda", dtype=torch.bfloat16):
-        output: CausalLMOutputWithPast = vla(
+        output_fresh: CausalLMOutputWithPast = vla(
             input_ids=batch["input_ids"].to(device_id),
             attention_mask=batch["attention_mask"].to(device_id),
-            pixel_values=batch["pixel_values"].to(torch.bfloat16).to(device_id),
+            pixel_values=current_pixel_values,
             labels=batch["labels"],
             output_hidden_states=True,
             proprio=batch["proprio"] if use_proprio else None,
@@ -339,6 +361,24 @@ def run_forward_pass(
             use_film=use_film,
         )
 
+    # --- VLA forward pass on delayed frame (only when delayed_pixel_values is available) ---
+    output_stale = None
+    if delayed_pixel_values is not None:
+        with torch.autocast("cuda", dtype=torch.bfloat16):
+            output_stale = vla(
+                input_ids=batch["input_ids"].to(device_id),
+                attention_mask=batch["attention_mask"].to(device_id),
+                pixel_values=delayed_pixel_values,
+                labels=batch["labels"],
+                output_hidden_states=True,
+                proprio=batch["proprio"] if use_proprio else None,
+                proprio_projector=proprio_projector if use_proprio else None,
+                noisy_actions=noisy_actions if use_diffusion else None,
+                noisy_action_projector=noisy_action_projector if use_diffusion else None,
+                diffusion_timestep_embeddings=diffusion_timestep_embeddings if use_diffusion else None,
+                use_film=use_film,
+            )
+
     # Get action masks needed for logging
     ground_truth_token_ids = batch["labels"][:, 1:].to(device_id)
     current_action_mask = get_current_action_mask(ground_truth_token_ids)
@@ -346,8 +386,8 @@ def run_forward_pass(
 
     # Compute metrics for discrete action representation (next-token prediction)
     if not (use_l1_regression or use_diffusion):
-        loss = output.loss
-        predicted_token_ids = output.logits[:, num_patches:-1].argmax(dim=2)
+        loss = output_fresh.loss
+        predicted_token_ids = output_fresh.logits[:, num_patches:-1].argmax(dim=2)
         curr_action_accuracy = compute_token_accuracy(
             predicted_token_ids, ground_truth_token_ids, mask=current_action_mask
         )
@@ -371,27 +411,47 @@ def run_forward_pass(
         )
     # Compute metrics for continuous action representations (L1 regression | diffusion)
     else:
-        # Get last layer hidden states
-        last_hidden_states = output.hidden_states[-1]  # (B, seq_len, D)
-        # Get hidden states for text portion of prompt+response (after the vision patches)
-        text_hidden_states = last_hidden_states[:, num_patches:-1]
-        # Get hidden states for action portion of response
-        batch_size = batch["input_ids"].shape[0]
-        actions_hidden_states = (
-            text_hidden_states[current_action_mask | next_actions_mask]
-            .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
-            .to(torch.bfloat16)
-        )  # (B, act_chunk_len, D)
+        # Helper: extract action-token hidden states from VLA output
+        def extract_action_hidden_states(vla_output):
+            last_hidden = vla_output.hidden_states[-1]  # (B, seq_len, D)
+            text_hidden = last_hidden[:, num_patches:-1]
+            batch_size = batch["input_ids"].shape[0]
+            return (
+                text_hidden[current_action_mask | next_actions_mask]
+                .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
+                .to(torch.bfloat16)
+            )  # (B, chunk_len * action_dim, D)
+
+        # Fresh hidden states from current frame (always available)
+        h_fresh = extract_action_hidden_states(output_fresh)
 
         if use_l1_regression:
-            # Predict action
-            predicted_actions = action_head.module.predict_action(actions_hidden_states)
-            # Get full L1 loss
-            loss = torch.nn.L1Loss()(ground_truth_actions, predicted_actions)
+            if use_vision_action_head and output_stale is not None:
+                # --- Dual-path loss: fresh + stale (frame delay active) ---
+                h_stale = extract_action_hidden_states(output_stale)
+
+                # Both paths use current pixel_values (real-time vision from local camera)
+                action_fresh = action_head.module.predict_action(h_fresh, pixel_values=current_pixel_values)
+                action_stale = action_head.module.predict_action(h_stale, pixel_values=current_pixel_values)
+
+                loss_fresh = torch.nn.L1Loss()(action_fresh, ground_truth_actions)
+                loss_stale = torch.nn.L1Loss()(action_stale, ground_truth_actions)
+                loss = loss_fresh + loss_stale
+
+                predicted_actions = action_fresh  # for detailed logging
+                metrics["loss_fresh"] = loss_fresh.item()
+                metrics["loss_stale"] = loss_stale.item()
+            else:
+                # --- Single-path loss: fresh only (no frame delay) ---
+                if use_vision_action_head:
+                    predicted_actions = action_head.module.predict_action(h_fresh, pixel_values=current_pixel_values)
+                else:
+                    predicted_actions = action_head.module.predict_action(h_fresh)
+                loss = torch.nn.L1Loss()(predicted_actions, ground_truth_actions)
 
         if use_diffusion:
             # Predict noise
-            noise_pred = action_head.module.predict_noise(actions_hidden_states)
+            noise_pred = action_head.module.predict_noise(h_fresh)
             # Get diffusion noise prediction MSE loss
             noise_pred = noise_pred.reshape(noise.shape)
             loss = nn.functional.mse_loss(noise_pred, noise, reduction="mean")
@@ -724,6 +784,9 @@ def run_validation(
                 num_patches=num_patches,
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                use_vision_action_head=cfg.use_vision_action_head,
+                # Note: validation batch may contain delayed_pixel_values from dataset;
+                # the dual-path loss will be used if present, matching training behavior.
             )
 
             # Add the loss value to the metrics
@@ -886,14 +949,31 @@ def finetune(cfg: FinetuneConfig) -> None:
 
     # If applicable, instantiate continuous action head for L1 regression
     if cfg.use_l1_regression:
-        action_head = init_module(
-            L1RegressionActionHead,
-            "action_head",
-            cfg,
-            device_id,
-            {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
-            to_bf16=True,
-        )
+        if cfg.use_vision_action_head:
+            action_head = init_module(
+                VisionActionHead,
+                "action_head",
+                cfg,
+                device_id,
+                {
+                    "input_dim": vla.module.llm_dim,
+                    "hidden_dim": vla.module.llm_dim,
+                    "action_dim": ACTION_DIM,
+                    "vision_encoder_name": cfg.action_head_vision_encoder,
+                    "freeze_vision_encoder": cfg.freeze_action_head_vision,
+                    "num_views": cfg.action_head_num_views,
+                },
+                to_bf16=True,
+            )
+        else:
+            action_head = init_module(
+                L1RegressionActionHead,
+                "action_head",
+                cfg,
+                device_id,
+                {"input_dim": vla.module.llm_dim, "hidden_dim": vla.module.llm_dim, "action_dim": ACTION_DIM},
+                to_bf16=True,
+            )
 
     # If applicable, instantiate diffusion action head and noisy action projector
     if cfg.use_diffusion:
@@ -974,6 +1054,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         prompt_builder_fn=PurePromptBuilder,
         use_wrist_image=use_wrist_image,
         use_proprio=cfg.use_proprio,
+        use_frame_delay=cfg.use_frame_delay and cfg.use_vision_action_head,
     )
     train_dataset = RLDSDataset(
         cfg.data_root_dir,
@@ -982,6 +1063,7 @@ def finetune(cfg: FinetuneConfig) -> None:
         resize_resolution=tuple(vla.module.config.image_sizes),
         shuffle_buffer_size=cfg.shuffle_buffer_size,
         image_aug=cfg.image_aug,
+        window_size=cfg.window_size,
     )
     if cfg.use_val_set:
         val_dataset = RLDSDataset(
@@ -992,6 +1074,7 @@ def finetune(cfg: FinetuneConfig) -> None:
             shuffle_buffer_size=cfg.shuffle_buffer_size // 10,
             image_aug=cfg.image_aug,
             train=False,
+            window_size=cfg.window_size,
         )
 
     # [Important] Save dataset statistics so that we can unnormalize actions during inference
@@ -1019,6 +1102,13 @@ def finetune(cfg: FinetuneConfig) -> None:
             num_workers=0,  # Important: Set to 0 if using RLDS, which uses its own parallelism
         )
 
+    # --- Frame Delay: window_size > 1 provides same-episode historical frames from dataset ---
+    if cfg.use_frame_delay and cfg.use_vision_action_head:
+        print(f"Frame delay enabled: window_size={cfg.window_size}")
+        print("  Delayed frames come from dataset window (same episode)")
+        print("  VLA runs on both delayed and current frames each step")
+        print("  VisionActionHead fuses stale latents + real-time vision (learned correction)")
+
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_metrics = {
         "loss_value": deque(maxlen=cfg.grad_accumulation_steps),
@@ -1026,6 +1116,8 @@ def finetune(cfg: FinetuneConfig) -> None:
         "curr_action_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_accuracy": deque(maxlen=cfg.grad_accumulation_steps),
         "next_actions_l1_loss": deque(maxlen=cfg.grad_accumulation_steps),
+        "loss_fresh": deque(maxlen=cfg.grad_accumulation_steps),
+        "loss_stale": deque(maxlen=cfg.grad_accumulation_steps),
     }
 
     # Start training
@@ -1050,6 +1142,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 num_patches=NUM_PATCHES,
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
+                use_vision_action_head=cfg.use_vision_action_head,
             )
 
             # Normalize loss to account for gradient accumulation

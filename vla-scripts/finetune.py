@@ -318,8 +318,8 @@ def run_forward_pass(
     """
     metrics = {}
 
-    # Get ground-truth action labels
-    ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
+    # Get ground-truth action labels (current chunk only, discard future chunks)
+    ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)[:, :NUM_ACTIONS_CHUNK]
 
     # [Only for diffusion] Sample noisy actions used as input for noise predictor network
     if use_diffusion:
@@ -411,16 +411,19 @@ def run_forward_pass(
         )
     # Compute metrics for continuous action representations (L1 regression | diffusion)
     else:
-        # Helper: extract action-token hidden states from VLA output
+        # Helper: extract current-chunk action-token hidden states from VLA output
         def extract_action_hidden_states(vla_output):
             last_hidden = vla_output.hidden_states[-1]  # (B, seq_len, D)
-            text_hidden = last_hidden[:, num_patches:-1]
+            text_hidden = last_hidden[:, num_patches:-1]  # (B, text_len, D)
             batch_size = batch["input_ids"].shape[0]
-            return (
-                text_hidden[current_action_mask | next_actions_mask]
-                .reshape(batch_size, NUM_ACTIONS_CHUNK * ACTION_DIM, -1)
-                .to(torch.bfloat16)
-            )  # (B, chunk_len * action_dim, D)
+            action_mask = current_action_mask | next_actions_mask  # (B, text_len)
+            selected = text_hidden[action_mask].to(torch.bfloat16)  # (num_total, D)
+            hidden_dim = selected.shape[-1]
+            # selected: (B * total_action_tokens, D)
+            # total_action_tokens may include future chunks; take only current chunk (NUM_ACTIONS_CHUNK)
+            all_tokens = selected.reshape(batch_size, -1, hidden_dim)  # (B, total_chunks * ACTION_DIM, D)
+            current_chunk = all_tokens[:, :NUM_ACTIONS_CHUNK * ACTION_DIM]  # (B, NUM_ACTIONS_CHUNK * ACTION_DIM, D)
+            return current_chunk
 
         # Fresh hidden states from current frame (always available)
         h_fresh = extract_action_hidden_states(output_fresh)

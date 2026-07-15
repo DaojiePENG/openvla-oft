@@ -11,7 +11,7 @@ from torch.multiprocessing import Process
 # --------------------------
 DATE_TIME = time.strftime("%Y_%m_%d-%H_%M_%S")
 # 确保日志目录存在（如果不存在则创建）
-LOG_DIR = "experiments/logs_oft_maxwindow30"
+LOG_DIR = "experiments/logs_oft_v2_maxwindow40"
 os.makedirs(LOG_DIR, exist_ok=True)  # exist_ok=True 避免目录已存在时报错
 
 TASKS_OPENVLA_OFT = [
@@ -91,6 +91,10 @@ def run_single_task(task):
         "python", "experiments/robot/libero/run_libero_eval.py",
         "--pretrained_checkpoint", task["checkpoint"],
         "--task_suite_name", task["task_suite"],
+        "--num_images_in_input", "2",
+        "--use_proprio", "True",
+        "--use_vision_action_head", "False",
+        "--use_vision_action_head_e2", "False",
         "--local_log_dir", LOG_DIR,
     ]
     

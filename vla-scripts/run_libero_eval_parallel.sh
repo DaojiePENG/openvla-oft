@@ -1,10 +1,10 @@
 #!/bin/bash
-#SBATCH --job-name=libero_eval_mp      # 作业名称：使用多进程(multiprocessing)的评估任务
+#SBATCH --job-name=libero_v2_eval_mp      # 作业名称：使用多进程(multiprocessing)的评估任务
 #SBATCH --nodes=1                      # 仅使用1个计算节点（所有GPU在同一节点）
 #SBATCH --ntasks=1                     # 提交1个主任务（核心：规避AssocMaxSubmitJobLimit限制）
 #SBATCH --cpus-per-task=32             # 分配32个CPU核心（4任务×8核心/任务，避免CPU资源竞争）
-#SBATCH --output=libero_eval_mp_%j.out # 主任务输出日志，%j为作业ID
-#SBATCH --error=libero_eval_mp_%j.err  # 主任务错误日志
+#SBATCH --output=libero_v2_eval_mp_%j.out # 主任务输出日志，%j为作业ID
+#SBATCH --error=libero_v2_eval_mp_%j.err  # 主任务错误日志
 #SBATCH --nodelist=4090node2           # 指定运行节点（根据集群配置修改）
 #SBATCH --gres=gpu:4                   # 一次性申请4张GPU（供内部4个任务分配）
 

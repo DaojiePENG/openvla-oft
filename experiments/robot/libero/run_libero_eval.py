@@ -144,7 +144,7 @@ class GenerateConfig:
     eval_delay_kwargs: Optional[Dict] = None
     # eval_delay_kwargs包含以下可选参数：
     use_random_obs: bool = True             # 是否使用随机延迟
-    max_delay_window: int = 20              # 最大延迟步数
+    max_delay_window: int = 40              # 最大延迟步数
     random_seed: int = 42                   # 随机种子
     delay_distribution: str = "uniform"     # 延迟分布类型
     log_delay_info: bool = False            # 是否打印延迟信息

@@ -11,8 +11,8 @@ conda activate openvla-oft
 # Use a command specific to your machine: https://pytorch.org/get-started/locally/
 pip3 install torch torchvision torchaudio
 
-# Clone openvla-oft repo and pip install to download dependencies
-git clone https://github.com/moojink/openvla-oft.git
+# Clone the CloudEdgeVLA repo (frame_delay_stale_action branch) and pip install to download dependencies
+git clone -b frame_delay_stale_action https://github.com/DaojiePENG/openvla-oft.git
 cd openvla-oft
 pip install -e .
 

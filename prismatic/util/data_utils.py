@@ -143,6 +143,12 @@ class PaddedCollatorForActionPrediction:
         else:
             proprio = None
 
+        # Stack delayed_pixel_values (for paired-frame dual-path training)
+        if "delayed_pixel_values" in instances[0]:
+            delayed_pixel_values = torch.stack([instance["delayed_pixel_values"] for instance in instances])
+        else:
+            delayed_pixel_values = None
+
         output = dict(
             pixel_values=pixel_values,
             proprio=proprio,
@@ -151,6 +157,8 @@ class PaddedCollatorForActionPrediction:
             labels=labels,
             actions=actions,
         )
+        if delayed_pixel_values is not None:
+            output["delayed_pixel_values"] = delayed_pixel_values
         if dataset_names is not None:
             output["dataset_names"] = dataset_names
         return output

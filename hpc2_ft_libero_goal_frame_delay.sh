@@ -52,11 +52,17 @@ ACTION_HEAD_NUM_VIEWS=2
 USE_FRAME_DELAY=true
 WINDOW_SIZE=21
 
+# Curriculum Learning for Dual-Path Loss
+# λ linearly ramps from 0 → STALE_LOSS_LAMBDA_MAX over WARMUP steps, then holds.
+# Set WARMUP to -1 for auto (= max_steps/2).
+STALE_LOSS_LAMBDA_MAX=0.5
+STALE_LOSS_WARMUP_STEPS=-1
+
 # Training hyperparameters
 BATCH_SIZE=8
 LEARNING_RATE=0.0005
 LORA_RANK=16
-MAX_STEPS=200000
+MAX_STEPS=250000
 NUM_STEPS_BEFORE_DECAY=100000
 SAVE_FREQ=10000
 NUM_IMAGES=2
@@ -74,6 +80,8 @@ echo "Vision Encoder: ${ACTION_HEAD_VISION_ENCODER}"
 echo "Num Views: ${ACTION_HEAD_NUM_VIEWS}"
 echo "Frame Delay: ${USE_FRAME_DELAY}"
 echo "Window Size: ${WINDOW_SIZE}"
+echo "Stale Loss λ_max: ${STALE_LOSS_LAMBDA_MAX}"
+echo "Stale Loss Warmup: ${STALE_LOSS_WARMUP_STEPS} (-1 = auto)"
 echo "============================================================"
 
 echo "Started at: $(date)"
@@ -107,7 +115,9 @@ torchrun --nproc_per_node=1 --master_port=${MASTER_PORT} vla-scripts/finetune.py
     --freeze_action_head_vision ${FREEZE_ACTION_HEAD_VISION} \
     --action_head_num_views ${ACTION_HEAD_NUM_VIEWS} \
     --use_frame_delay ${USE_FRAME_DELAY} \
-    --window_size ${WINDOW_SIZE}
+    --window_size ${WINDOW_SIZE} \
+    --stale_loss_lambda_max ${STALE_LOSS_LAMBDA_MAX} \
+    --stale_loss_warmup_steps ${STALE_LOSS_WARMUP_STEPS}
 
 echo "=============================================="
 echo "Training completed at $(date)!"

@@ -342,7 +342,10 @@ class VisionActionHead(nn.Module):
         )
 
         # Fusion MLP: combines LLM hidden states + projected vision features
-        fusion_input_dim = input_dim * 2  # LLM + vision concatenated
+        # LLM side: per-chunk reshape preserves per-action-dimension information
+        #   (B, chunk_len, action_dim * input_dim), same as L1RegressionActionHead
+        # Vision side: (B, chunk_len, input_dim)
+        fusion_input_dim = input_dim * action_dim + input_dim
 
         self.fusion_mlp = MLPResNet(
             num_blocks=2,
@@ -383,9 +386,10 @@ class VisionActionHead(nn.Module):
         batch_size = llm_hidden_states.shape[0]
         device = llm_hidden_states.device
 
-        # Mean-pool LLM hidden states over action tokens per chunk position
-        # (B, chunk_len * action_dim, hidden_dim) -> (B, chunk_len, action_dim, hidden_dim) -> mean over action_dim -> (B, chunk_len, hidden_dim)
-        llm_features = llm_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, ACTION_DIM, -1).mean(dim=2)
+        # Reshape LLM hidden states to preserve per-action-dimension information
+        # (B, chunk_len * action_dim, hidden_dim) -> (B, chunk_len, action_dim * hidden_dim)
+        # Same reshape as L1RegressionActionHead — avoids lossy mean-pooling
+        llm_features = llm_hidden_states.reshape(batch_size, NUM_ACTIONS_CHUNK, -1)
 
         if pixel_values is not None:
             # Encode real-time vision
@@ -398,10 +402,13 @@ class VisionActionHead(nn.Module):
             vision_proj = vision_proj.unsqueeze(1).expand(-1, NUM_ACTIONS_CHUNK, -1)  # (B, chunk_len, input_dim)
 
             # Concatenate LLM and vision features
-            fused = torch.cat([llm_features, vision_proj], dim=-1)  # (B, chunk_len, input_dim * 2)
+            fused = torch.cat([llm_features, vision_proj], dim=-1)  # (B, chunk_len, action_dim*D + D)
         else:
             # No vision input — pad with zeros (fallback mode)
-            zeros = torch.zeros_like(llm_features)
+            zeros = torch.zeros(
+                batch_size, NUM_ACTIONS_CHUNK, self.vision_projector[0].out_features,
+                device=device, dtype=llm_features.dtype,
+            )
             fused = torch.cat([llm_features, zeros], dim=-1)
 
         # Predict actions

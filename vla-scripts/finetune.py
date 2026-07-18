@@ -110,6 +110,12 @@ class FinetuneConfig:
     freeze_action_head_vision: bool = True           # If True, freezes ActionHead's vision encoder
     action_head_num_views: int = 2                   # Number of image views for ActionHead vision encoder
 
+    # Curriculum learning for dual-path loss (L_fresh + L_stale)
+    # λ linearly increases from 0 → stale_loss_lambda_max over stale_loss_warmup_steps,
+    # then stays at stale_loss_lambda_max for the rest of training.
+    stale_loss_lambda_max: float = 0.5               # Maximum weight for L_stale (λ_max in paper)
+    stale_loss_warmup_steps: int = -1                # Steps to ramp λ from 0→λ_max; -1 = auto (max_steps/2)
+
     # LoRA
     use_lora: bool = True                            # If True, uses LoRA fine-tuning
     lora_rank: int = 32                              # Rank of LoRA weight matrix
@@ -274,6 +280,33 @@ def init_module(
     return wrap_ddp(module, device_id, find_unused_params)
 
 
+def compute_stale_loss_weight(
+    current_step: int,
+    warmup_steps: int,
+    lambda_max: float,
+    enabled: bool,
+) -> float:
+    """
+    Curriculum schedule for stale_loss_weight (λ).
+
+    λ linearly ramps from 0 → lambda_max over warmup_steps, then holds at lambda_max.
+
+    Args:
+        current_step: Current training step (gradient step, resume-aware).
+        warmup_steps: Number of steps to ramp λ; must already be resolved (not -1).
+        lambda_max: Maximum λ value.
+        enabled: Whether dual-path training is active at all.
+
+    Returns:
+        Current λ value.
+    """
+    if not enabled:
+        return 0.0
+    if warmup_steps <= 0:
+        return lambda_max  # no warmup → start at max immediately
+    return min(1.0, current_step / warmup_steps) * lambda_max
+
+
 def run_forward_pass(
     vla,
     action_head,
@@ -290,6 +323,7 @@ def run_forward_pass(
     compute_diffusion_l1=False,
     num_diffusion_steps_train=None,
     use_vision_action_head=False,
+    stale_loss_weight: float = 0.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """
     Compute model forward pass and metrics for both training and validation.
@@ -430,7 +464,7 @@ def run_forward_pass(
 
         if use_l1_regression:
             if use_vision_action_head and output_stale is not None:
-                # --- Dual-path loss: fresh + stale (frame delay active) ---
+                # --- Dual-path loss: (1-λ)*L_fresh + λ*L_stale (curriculum) ---
                 h_stale = extract_action_hidden_states(output_stale)
 
                 # Both paths use current pixel_values (real-time vision from local camera)
@@ -439,11 +473,12 @@ def run_forward_pass(
 
                 loss_fresh = torch.nn.L1Loss()(action_fresh, ground_truth_actions)
                 loss_stale = torch.nn.L1Loss()(action_stale, ground_truth_actions)
-                loss = loss_fresh + loss_stale
+                loss = (1.0 - stale_loss_weight) * loss_fresh + stale_loss_weight * loss_stale
 
                 predicted_actions = action_fresh  # for detailed logging
                 metrics["loss_fresh"] = loss_fresh.item()
                 metrics["loss_stale"] = loss_stale.item()
+                metrics["stale_loss_weight"] = stale_loss_weight
             else:
                 # --- Single-path loss: fresh only (no frame delay) ---
                 if use_vision_action_head:
@@ -769,6 +804,11 @@ def run_validation(
     # List to store validation metrics
     all_val_metrics = []
 
+    # Use current λ for validation (match training curriculum schedule)
+    val_warmup = cfg.stale_loss_warmup_steps if cfg.stale_loss_warmup_steps >= 0 else cfg.max_steps // 2
+    val_enabled = cfg.use_frame_delay and cfg.use_vision_action_head
+    val_stale_weight = compute_stale_loss_weight(log_step, val_warmup, cfg.stale_loss_lambda_max, val_enabled)
+
     with torch.no_grad():
         for batch in val_dataloader:
             # Always compute L1 loss for validation, even for diffusion
@@ -788,8 +828,7 @@ def run_validation(
                 compute_diffusion_l1=True,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
                 use_vision_action_head=cfg.use_vision_action_head,
-                # Note: validation batch may contain delayed_pixel_values from dataset;
-                # the dual-path loss will be used if present, matching training behavior.
+                stale_loss_weight=val_stale_weight,
             )
 
             # Add the loss value to the metrics
@@ -1112,6 +1151,13 @@ def finetune(cfg: FinetuneConfig) -> None:
         print("  VLA runs on both delayed and current frames each step")
         print("  VisionActionHead fuses stale latents + real-time vision (learned correction)")
 
+    # --- Curriculum schedule for stale_loss_weight (λ) ---
+    stale_loss_warmup_steps = cfg.stale_loss_warmup_steps
+    if stale_loss_warmup_steps < 0:
+        stale_loss_warmup_steps = cfg.max_steps // 2  # default: ramp over first half of training
+    if cfg.use_frame_delay and cfg.use_vision_action_head:
+        print(f"  Curriculum: λ ramps 0 → {cfg.stale_loss_lambda_max} over {stale_loss_warmup_steps} steps")
+
     # Deque to store recent train metrics (used for computing smoothened metrics for gradient accumulation)
     recent_metrics = {
         "loss_value": deque(maxlen=cfg.grad_accumulation_steps),
@@ -1130,6 +1176,13 @@ def finetune(cfg: FinetuneConfig) -> None:
         for batch_idx, batch in enumerate(dataloader):
             # Compute training metrics and loss
             compute_diffusion_l1 = cfg.use_diffusion and batch_idx % cfg.diffusion_sample_freq == 0
+
+            # Curriculum λ: linearly ramp from 0 → λ_max over warmup_steps, then hold
+            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
+            cur_step = gradient_step_idx + (cfg.resume_step if cfg.resume else 0)
+            dual_path_enabled = cfg.use_frame_delay and cfg.use_vision_action_head
+            cur_stale_weight = compute_stale_loss_weight(cur_step, stale_loss_warmup_steps, cfg.stale_loss_lambda_max, dual_path_enabled)
+
             loss, metrics = run_forward_pass(
                 vla=vla,
                 action_head=action_head,
@@ -1146,6 +1199,7 @@ def finetune(cfg: FinetuneConfig) -> None:
                 compute_diffusion_l1=compute_diffusion_l1,
                 num_diffusion_steps_train=cfg.num_diffusion_steps_train if cfg.use_diffusion else None,
                 use_vision_action_head=cfg.use_vision_action_head,
+                stale_loss_weight=cur_stale_weight,
             )
 
             # Normalize loss to account for gradient accumulation
@@ -1159,14 +1213,11 @@ def finetune(cfg: FinetuneConfig) -> None:
                 if metric_name in recent_metrics:
                     recent_metrics[metric_name].append(value)
 
-            # Compute gradient step index
-            gradient_step_idx = batch_idx // cfg.grad_accumulation_steps
-
             # Compute smoothened train metrics
             smoothened_metrics = compute_smoothened_metrics(recent_metrics)
 
             # Push Metrics to W&B (every wandb_log_freq gradient steps)
-            log_step = gradient_step_idx if not cfg.resume else cfg.resume_step + gradient_step_idx
+            log_step = cur_step
             if distributed_state.is_main_process and log_step % cfg.wandb_log_freq == 0:
                 log_metrics_to_wandb(smoothened_metrics, "VLA Train", log_step, wandb)
 

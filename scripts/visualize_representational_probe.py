@@ -27,6 +27,7 @@ Usage:
 """
 
 import argparse
+import json
 import os
 import sys
 import types
@@ -225,9 +226,12 @@ class _HS:
 
     def __enter__(self):
         outer = self
-        def _intercept(self_head, llm_hidden_states, pixel_values=None):
-            outer.hs = llm_hidden_states.detach().clone()
-            return outer._orig(self_head, llm_hidden_states, pixel_values)
+        def _intercept(self_head, *args, **kwargs):
+            # First positional arg is always llm_hidden_states for both
+            # L1RegressionActionHead(self, llm_hidden_states) and
+            # VisionActionHead(self, llm_hidden_states, pixel_values=None)
+            outer.hs = args[0].detach().clone()
+            return outer._orig(self_head, *args, **kwargs)
         self._ah.__class__.predict_action = _intercept
         return self
 
@@ -325,13 +329,16 @@ def train_and_eval_probe(
     y_train: np.ndarray,
     X_test:  np.ndarray,
     y_test:  np.ndarray,
-) -> float:
+) -> Tuple[float, np.ndarray]:
     """
     Train a Ridge regression probe and return the R² score on the test set.
 
     R² = 1 - SS_res / SS_tot.
     R² close to 1 → the hidden states contain the target information.
     R² close to 0 → the hidden states do NOT contain the target information.
+
+    Returns:
+        (mean_r2, r2_per_dim)  — average R² and per-dimension R² array
     """
     from sklearn.linear_model import Ridge
     from sklearn.preprocessing import StandardScaler
@@ -354,7 +361,7 @@ def train_and_eval_probe(
     ss_tot = np.sum((y_test_s - y_test_s.mean(axis=0, keepdims=True)) ** 2, axis=0)
     r2_per_dim = 1.0 - ss_res / (ss_tot + 1e-12)
 
-    return float(np.mean(r2_per_dim))  # average R² across target dimensions
+    return float(np.mean(r2_per_dim)), r2_per_dim  # average R² across target dimensions
 
 
 def run_probe_analysis(
@@ -366,14 +373,22 @@ def run_probe_analysis(
     lora_rank: int = 32,
     test_ratio: float = 0.3,
     seed: int = 42,
-) -> Dict[str, Dict[str, float]]:
+) -> Tuple[Dict[str, Dict[str, float]], Dict[str, any]]:
     """
     Run the full probe analysis for one task suite.
 
     Returns:
-        {
+        results: {
             "Standard VLA": {"high_level": R², "low_level": R²},
             "CloudEdgeVLA": {"high_level": R², "low_level": R²},
+        }
+        raw_info: {
+            "num_samples": int,
+            "num_train": int,
+            "num_test": int,
+            "high_level_dim_names": [...],
+            "low_level_dim_names": [...],
+            "per_dim_r2": {model: {"high_level": [...], "low_level": [...]}}
         }
     """
     # 1. Collect observations and labels
@@ -409,6 +424,12 @@ def run_probe_analysis(
     high_level_target = np.concatenate([object_lbl, progress_lbl], axis=1)
     low_level_target  = robot_lbl  # (N, 9)
 
+    # Dimension names for raw data export
+    n_obj_dims = object_lbl.shape[1]
+    high_level_dim_names = [f"object_pos_{i}" for i in range(n_obj_dims)] + ["goal_progress"]
+    low_level_dim_names = ["eef_x", "eef_y", "eef_z", "eef_ax", "eef_ay", "eef_az",
+                           "gripper_qpos_0", "gripper_qpos_1", "gripper_open"]
+
     # 5. Train/test split
     np.random.seed(seed)
     N = len(flat_obs)
@@ -421,21 +442,35 @@ def run_probe_analysis(
 
     # 6. Train probes for both models
     results = {}
+    per_dim_r2 = {}
     for label, hs in [("Standard VLA", hs_std), ("CloudEdgeVLA", hs_ours)]:
         print(f"\n  [{label}]")
-        r2_high = train_and_eval_probe(
+        r2_high, r2_high_dims = train_and_eval_probe(
             hs[train_idx], high_level_target[train_idx],
             hs[test_idx],  high_level_target[test_idx],
         )
-        r2_low = train_and_eval_probe(
+        r2_low, r2_low_dims = train_and_eval_probe(
             hs[train_idx], low_level_target[train_idx],
             hs[test_idx],  low_level_target[test_idx],
         )
         results[label] = {"high_level": r2_high, "low_level": r2_low}
+        per_dim_r2[label] = {
+            "high_level": r2_high_dims.tolist(),
+            "low_level": r2_low_dims.tolist(),
+        }
         print(f"    High-level (object + goal) R² = {r2_high:.4f}")
         print(f"    Low-level  (robot state)    R² = {r2_low:.4f}")
 
-    return results
+    raw_info = {
+        "num_samples": N,
+        "num_train": len(train_idx),
+        "num_test": len(test_idx),
+        "high_level_dim_names": high_level_dim_names,
+        "low_level_dim_names": low_level_dim_names,
+        "per_dim_r2": per_dim_r2,
+    }
+
+    return results, raw_info
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -505,6 +540,59 @@ def plot_probe_results(
 
 
 # ───────────────────────────────────────────────────────────────────────────
+# Raw data export
+# ───────────────────────────────────────────────────────────────────────────
+def save_raw_data(
+    output_path: str,
+    all_results: Dict[str, Dict[str, Dict[str, float]]],
+    all_raw_info: Dict[str, Dict[str, any]],
+    args: argparse.Namespace,
+) -> None:
+    """
+    Save raw probe data alongside the figure.
+
+    Saves a JSON file with the same stem as the PDF output, e.g.
+        results/fig5_probe_goal.pdf  →  results/fig5_probe_goal_data.json
+    """
+    stem, _ = os.path.splitext(output_path)
+    json_path = stem + "_data.json"
+
+    export: Dict[str, any] = {
+        "config": {
+            "checkpoint_standard": args.checkpoint_standard,
+            "checkpoint_ours": args.checkpoint_ours,
+            "task_suite_name": args.task_suite_name,
+            "num_episodes": args.num_episodes,
+            "num_frames": args.num_frames,
+            "lora_rank": args.lora_rank,
+            "test_ratio": args.test_ratio,
+            "seed": args.seed,
+        },
+        "suites": {},
+    }
+
+    for suite_label, results in all_results.items():
+        raw = all_raw_info.get(suite_label, {})
+        suite_data: Dict[str, any] = {
+            "summary": results,
+            "num_samples": raw.get("num_samples"),
+            "num_train": raw.get("num_train"),
+            "num_test": raw.get("num_test"),
+            "dim_names": {
+                "high_level": raw.get("high_level_dim_names", []),
+                "low_level": raw.get("low_level_dim_names", []),
+            },
+            "per_dim_r2": raw.get("per_dim_r2", {}),
+        }
+        export["suites"][suite_label] = suite_data
+
+    os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
+    with open(json_path, "w") as f:
+        json.dump(export, f, indent=2, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o))
+    print(f"[INFO] Raw data saved → {json_path}")
+
+
+# ───────────────────────────────────────────────────────────────────────────
 # CLI
 # ───────────────────────────────────────────────────────────────────────────
 def main():
@@ -528,9 +616,10 @@ def main():
 
     if args.task_suite_name == "all":
         all_results = {}
+        all_raw_info = {}
         for suite in TASK_SUITE_NAMES:
             print(f"\n{'='*60}\n[SUITE] {suite}\n{'='*60}")
-            all_results[TASK_SUITE_LABELS[suite]] = run_probe_analysis(
+            results, raw_info = run_probe_analysis(
                 checkpoint_standard=args.checkpoint_standard,
                 checkpoint_ours=args.checkpoint_ours,
                 task_suite_name=suite,
@@ -540,9 +629,12 @@ def main():
                 test_ratio=args.test_ratio,
                 seed=args.seed,
             )
+            all_results[TASK_SUITE_LABELS[suite]] = results
+            all_raw_info[TASK_SUITE_LABELS[suite]] = raw_info
         plot_probe_results(all_results, args.output_path)
+        save_raw_data(args.output_path, all_results, all_raw_info, args)
     else:
-        results = run_probe_analysis(
+        results, raw_info = run_probe_analysis(
             checkpoint_standard=args.checkpoint_standard,
             checkpoint_ours=args.checkpoint_ours,
             task_suite_name=args.task_suite_name,
@@ -553,7 +645,10 @@ def main():
             seed=args.seed,
         )
         suite_label = TASK_SUITE_LABELS.get(args.task_suite_name, args.task_suite_name)
-        plot_probe_results({suite_label: results}, args.output_path)
+        all_results = {suite_label: results}
+        all_raw_info = {suite_label: raw_info}
+        plot_probe_results(all_results, args.output_path)
+        save_raw_data(args.output_path, all_results, all_raw_info, args)
 
     # Summary
     print("\n" + "="*60)
@@ -561,8 +656,7 @@ def main():
     print("="*60)
     print(f"{'Suite':<12} {'Model':<18} {'High-Level':>12} {'Low-Level':>12}")
     print("-" * 60)
-    source = all_results if args.task_suite_name == "all" else {suite_label: results}
-    for s, sres in source.items():
+    for s, sres in all_results.items():
         for m, mres in sres.items():
             print(f"{s:<12} {m:<18} {mres['high_level']:>12.4f} {mres['low_level']:>12.4f}")
 

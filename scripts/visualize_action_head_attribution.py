@@ -30,6 +30,7 @@ Usage (all 4 suites, grouped bar chart):
 """
 
 import argparse
+import json
 import os
 import sys
 from collections import defaultdict
@@ -91,11 +92,13 @@ class _HiddenStateCapture:
     def __enter__(self):
         _outer = self  # capture for closure
 
-        def _intercepting_predict(self_head, llm_hidden_states, pixel_values=None):
-            # Save a detached clone for later analysis
-            _outer.hidden_states = llm_hidden_states.detach().clone()
+        def _intercepting_predict(self_head, *args, **kwargs):
+            # First positional arg is always llm_hidden_states for both
+            # L1RegressionActionHead(self, llm_hidden_states) and
+            # VisionActionHead(self, llm_hidden_states, pixel_values=None)
+            _outer.hidden_states = args[0].detach().clone()
             # Run the real action head so the VLA can finish its forward pass
-            return _outer._original_predict(self_head, llm_hidden_states, pixel_values)
+            return _outer._original_predict(self_head, *args, **kwargs)
 
         # Monkey-patch at class level (affects all instances, but we only have one)
         self._action_head.__class__.predict_action = _intercepting_predict
@@ -265,7 +268,7 @@ def compute_gradient_attribution(
     action_head: VisionActionHead,
     h_stale: torch.Tensor,
     pixel_values_current: torch.Tensor,
-) -> float:
+) -> Tuple[float, float, float]:
     """
     Gradient-based effective attribution:
 
@@ -273,17 +276,18 @@ def compute_gradient_attribution(
 
     High α → planning features dominate (small delay).
     Low  α → vision features dominate (large delay, planning stale).
+
+    Returns:
+        (alpha, norm_h, norm_z)
     """
     was_training = action_head.training
     action_head.train()  # enable grad through fusion_mlp
 
     B = h_stale.shape[0]
 
-    # --- LLM path: mean-pool over action_dim axis ---
-    llm_features = (
-        h_stale.reshape(B, NUM_ACTIONS_CHUNK, ACTION_DIM, -1)
-        .mean(dim=2)                        # (B, chunk, D)
-    )
+    # --- LLM path: reshape to preserve per-action-dimension information ---
+    # (B, chunk_len * action_dim, hidden_dim) -> (B, chunk_len, action_dim * hidden_dim)
+    llm_features = h_stale.reshape(B, NUM_ACTIONS_CHUNK, -1)
     llm_features = llm_features.detach().requires_grad_(True)
 
     # --- Vision path ---
@@ -294,7 +298,7 @@ def compute_gradient_attribution(
     vision_proj = vision_proj.unsqueeze(1).expand(-1, NUM_ACTIONS_CHUNK, -1)
 
     # --- Fusion + prediction ---
-    fused = torch.cat([llm_features, vision_proj], dim=-1)            # (B, chunk, 2D)
+    fused = torch.cat([llm_features, vision_proj], dim=-1)            # (B, chunk, action_dim*D + D)
     actions = action_head.fusion_mlp(fused)                           # (B, chunk, act_dim)
 
     # Scalar target for backward
@@ -309,7 +313,7 @@ def compute_gradient_attribution(
     alpha = nh / (nh + nz + 1e-8)
 
     action_head.train(was_training)
-    return alpha
+    return alpha, nh, nz
 
 
 def compute_ablation_attribution(
@@ -346,12 +350,14 @@ def run_attribution(
     lora_rank: int = 32,
     action_head_vision_encoder: str = "siglip-base",
     num_views: int = 2,
-) -> Dict[int, List[float]]:
+) -> Tuple[Dict[int, List[float]], Dict[str, any]]:
     """
     Run the full attribution sweep over delays for one task suite.
 
     Returns:
-        dict  delay -> list of α values
+        results:  dict  delay -> list of α values
+        raw_info: dict  with per-sample gradient norms (gradient method)
+                      and per-task breakdown for saving to JSON
     """
     if delays is None:
         delays = DEFAULT_DELAYS
@@ -368,6 +374,9 @@ def run_attribution(
     img_cfg = types.SimpleNamespace(num_images_in_input=num_views, center_crop=cfg.center_crop)
 
     results = defaultdict(list)
+    # Per-task breakdown and gradient norm details for raw data export
+    per_task_results: Dict[str, Dict[int, List[float]]] = {}
+    grad_norms: Dict[int, List[Dict[str, float]]] = defaultdict(list)  # delay -> [{alpha, nh, nz}, ...]
 
     from transformers import LlamaTokenizerFast
     tokenizer = processor.tokenizer
@@ -375,6 +384,7 @@ def run_attribution(
     for task_desc, obs_list in all_obs.items():
         print(f"  [TASK] {task_desc}  ({len(obs_list)} frames)")
         n = len(obs_list)
+        per_task_results[task_desc] = defaultdict(list)
 
         # Pre-compute pixel_values for every frame to avoid redundant processing
         pvs = [obs_to_pixel_values(o, processor, img_cfg) for o in obs_list]
@@ -408,13 +418,22 @@ def run_attribution(
 
                 # --- Compute attribution ---
                 if method == "gradient":
-                    alpha = compute_gradient_attribution(action_head, h_stale, pv_current)
+                    alpha, nh, nz = compute_gradient_attribution(action_head, h_stale, pv_current)
+                    grad_norms[delay].append({"alpha": alpha, "norm_h": nh, "norm_z": nz})
                 else:
                     alpha = compute_ablation_attribution(action_head, h_stale, pv_current)
 
                 results[delay].append(alpha)
+                per_task_results[task_desc][delay].append(alpha)
 
-    return dict(results)
+    # Convert defaultdicts to regular dicts for JSON serialization
+    raw_info = {
+        "per_task": {task: dict(dl) for task, dl in per_task_results.items()},
+    }
+    if method == "gradient":
+        raw_info["grad_norms"] = {int(d): vlist for d, vlist in grad_norms.items()}
+
+    return dict(results), raw_info
 
 
 # ---------------------------------------------------------------------------
@@ -517,6 +536,85 @@ def plot_grouped_bars(
 
 
 # ---------------------------------------------------------------------------
+# Raw data export
+# ---------------------------------------------------------------------------
+def save_raw_data(
+    output_path: str,
+    all_results: Dict[str, Dict[int, List[float]]],
+    all_raw_info: Dict[str, Dict[str, any]],
+    args: argparse.Namespace,
+) -> None:
+    """
+    Save raw attribution data and configuration alongside the figure.
+
+    Saves a JSON file with the same stem as the PDF output, e.g.
+        results/fig6_attribution_goal.pdf  →  results/fig6_attribution_goal_data.json
+    """
+    stem, _ = os.path.splitext(output_path)
+    json_path = stem + "_data.json"
+
+    export: Dict[str, any] = {
+        "config": {
+            "pretrained_checkpoint": args.pretrained_checkpoint,
+            "task_suite_name": args.task_suite_name,
+            "method": args.method,
+            "delays": args.delays if args.delays is not None else DEFAULT_DELAYS,
+            "num_episodes": args.num_episodes,
+            "num_frames": args.num_frames,
+            "max_samples_per_delay": args.max_samples_per_delay,
+            "lora_rank": args.lora_rank,
+            "action_head_vision_encoder": args.action_head_vision_encoder,
+            "num_views": args.num_views,
+        },
+        "suites": {},
+    }
+
+    for suite_key, results in all_results.items():
+        suite_data: Dict[str, any] = {
+            "summary": {},
+            "per_task": {},
+        }
+        # Per-delay summary
+        for d in sorted(results):
+            v = results[d]
+            suite_data["summary"][str(d)] = {
+                "mean": float(np.mean(v)),
+                "std": float(np.std(v)),
+                "n": len(v),
+                "values": v,
+            }
+        # Per-task breakdown (if available)
+        raw = all_raw_info.get(suite_key, {})
+        if "per_task" in raw:
+            for task, task_res in raw["per_task"].items():
+                suite_data["per_task"][task] = {
+                    str(d): {
+                        "mean": float(np.mean(vals)),
+                        "std": float(np.std(vals)),
+                        "n": len(vals),
+                        "values": vals,
+                    }
+                    for d, vals in task_res.items()
+                }
+        # Gradient norms (if gradient method)
+        if "grad_norms" in raw:
+            suite_data["grad_norms"] = {}
+            for d, entries in raw["grad_norms"].items():
+                suite_data["grad_norms"][str(d)] = {
+                    "mean_alpha": float(np.mean([e["alpha"] for e in entries])),
+                    "mean_norm_h": float(np.mean([e["norm_h"] for e in entries])),
+                    "mean_norm_z": float(np.mean([e["norm_z"] for e in entries])),
+                    "per_sample": entries,
+                }
+        export["suites"][suite_key] = suite_data
+
+    os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
+    with open(json_path, "w") as f:
+        json.dump(export, f, indent=2, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o))
+    print(f"[INFO] Raw data saved → {json_path}")
+
+
+# ---------------------------------------------------------------------------
 # Summary printer
 # ---------------------------------------------------------------------------
 def print_summary(results: Dict[int, List[float]], label: str = "") -> None:
@@ -553,9 +651,10 @@ def main():
 
     if args.task_suite_name == "all":
         all_res = {}
+        all_raw_info = {}
         for suite in TASK_SUITE_NAMES:
             print(f"\n{'='*60}\n[SUITE] {suite}\n{'='*60}")
-            all_res[suite] = run_attribution(
+            results, raw_info = run_attribution(
                 pretrained_checkpoint=args.pretrained_checkpoint,
                 task_suite_name=suite,
                 delays=delays,
@@ -567,11 +666,14 @@ def main():
                 action_head_vision_encoder=args.action_head_vision_encoder,
                 num_views=args.num_views,
             )
+            all_res[suite] = results
+            all_raw_info[suite] = raw_info
         plot_grouped_bars(all_res, args.output_path, args.method)
+        save_raw_data(args.output_path, all_res, all_raw_info, args)
         for suite, r in all_res.items():
             print_summary(r, TASK_SUITE_LABELS.get(suite, suite))
     else:
-        results = run_attribution(
+        results, raw_info = run_attribution(
             pretrained_checkpoint=args.pretrained_checkpoint,
             task_suite_name=args.task_suite_name,
             delays=delays,
@@ -585,6 +687,10 @@ def main():
         )
         plot_curves(results, args.output_path, args.method,
                      title_suffix=f" ({TASK_SUITE_LABELS.get(args.task_suite_name, args.task_suite_name)})")
+        save_raw_data(args.output_path,
+                      {TASK_SUITE_LABELS.get(args.task_suite_name, args.task_suite_name): results},
+                      {TASK_SUITE_LABELS.get(args.task_suite_name, args.task_suite_name): raw_info},
+                      args)
         print_summary(results)
 
 

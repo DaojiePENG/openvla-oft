@@ -59,7 +59,8 @@ STALE_LOSS_LAMBDA_MAX=0.5
 STALE_LOSS_WARMUP_STEPS=-1
 
 # Training hyperparameters
-BATCH_SIZE=8
+BATCH_SIZE=4                    # Halved from 8: frame_delay does 2 sequential forwards, each uses half the memory
+GRAD_ACCUM_STEPS=2              # Effective batch = 4 * 2 = 8 (same as before)
 LEARNING_RATE=0.0005
 LORA_RANK=16
 MAX_STEPS=250000
@@ -72,7 +73,8 @@ echo "============================================================"
 echo "Frame Delay + VisionActionHead Training"
 echo "============================================================"
 echo "Dataset: ${DATASET_NAME}"
-echo "Batch Size: ${BATCH_SIZE}"
+echo "Batch Size: ${BATCH_SIZE} (effective: $((BATCH_SIZE * GRAD_ACCUM_STEPS)))"
+echo "Grad Accum Steps: ${GRAD_ACCUM_STEPS}"
 echo "Learning Rate: ${LEARNING_RATE}"
 echo "LoRA Rank: ${LORA_RANK}"
 echo "VisionActionHead: ${USE_VISION_ACTION_HEAD}"
@@ -95,6 +97,7 @@ torchrun --nproc_per_node=1 --master_port=${MASTER_PORT} vla-scripts/finetune.py
     --dataset_name "${DATASET_NAME}" \
     --run_root_dir "${RUN_ROOT_DIR}" \
     --batch_size ${BATCH_SIZE} \
+    --grad_accumulation_steps ${GRAD_ACCUM_STEPS} \
     --learning_rate ${LEARNING_RATE} \
     --lora_rank ${LORA_RANK} \
     --max_steps ${MAX_STEPS} \

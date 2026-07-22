@@ -1,0 +1,36 @@
+# OpenVLA-OFT Pinned Dependencies
+# Generated from successful training run on 2026-07-22
+# Tested with: train_local.sh --num_gpus 2
+
+# === Core Dependencies (版本敏感) ===
+protobuf==5.29.2            # 必须 >=5.26.0, 否则 runtime_version ImportError
+tensorflow==2.15.0
+tensorflow-datasets==4.9.3
+tensorflow-metadata==1.14.0 # 必须 1.14.x for protobuf 5.x compatibility
+
+# === PyTorch Stack ===
+torch==2.3.1
+torchvision==0.18.1
+torchaudio==2.11.0
+
+# === Transformers ===
+transformers==4.40.1
+huggingface-hub>=0.20.0
+
+# === Scientific Computing ===
+numpy==1.24.3
+scipy==1.11.4               # 必须 <1.14, 否则 ufunc compatibility error
+
+# === ML Libraries ===
+timm==0.9.10
+dlimp==0.0.1
+wandb==0.28.0
+draccus==0.8.0
+
+# === Optional (uncomment if needed) ===
+# tensorflow-graphics==2021.12.3
+# tensorflow-addons==0.23.0
+# tensorflow-io-gcs-filesystem==0.37.1
+
+# === Installation Command ===
+# pip install -r requirements_pinned.txt

@@ -23,6 +23,7 @@ conda activate openvla-oft
 export HF_HOME="/hpc2hdd/home/tzhuang778/daojie/huggingface"
 export CUDA_VISIBLE_DEVICES=0
 export TOKENIZERS_PARALLELISM=false
+export TF_CPP_MIN_LOG_LEVEL=3
 
 mkdir -p logs results
 
@@ -41,8 +42,8 @@ echo "============================================================"
 BASE_DIR="/hpc2hdd/home/tzhuang778/daojie/openvla-oft"
 
 # Checkpoints
-CKPT_STANDARD="${BASE_DIR}/data/openvla-7b-oft-finetuned-libero-goal"
-CKPT_OURS="${BASE_DIR}/runs/openvla-7b+libero_goal_no_noops+b8+lr-0.0005+lora-r16+dropout-0.0--image_aug--frame_delay_w21_visionAH--200000_chkpt"
+CKPT_STANDARD="${BASE_DIR}/data/openvla-7b-oft-finetuned-libero-spatial-object-goal-10"
+CKPT_OURS="${BASE_DIR}/runs/openvla-7b-oft-finetuned-libero-spatial-object-goal-10+libero_goal_no_noops+b4+lr-0.0005+lora-r16+dropout-0.0--image_aug--frame_delay_w21_visionAH--10000_chkpt"
 
 # Verify checkpoints exist
 if [ ! -d "$CKPT_STANDARD" ]; then

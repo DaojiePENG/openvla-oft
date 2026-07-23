@@ -41,6 +41,32 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torchvision.transforms.functional as _TVF
+
+# Importing prismatic.vla pulls in TensorFlow through the RLDS package. Disable
+# TensorFlow GPU discovery before that import so it cannot reserve H800 memory.
+import tensorflow as _tf
+try:
+    _tf.config.set_visible_devices([], "GPU")
+except RuntimeError:
+    pass
+
+# Monkey-patch to_tensor to work with numpy 1.26 + torch 2.3 ABI mismatch
+# (torch.from_numpy and torch.tensor(numpy) both fail due to ABI incompatibility)
+_orig_to_tensor = _TVF.to_tensor
+def _patched_to_tensor(pic):
+    import numpy as np
+    mode_to_nptype = {"I": np.int32, "I;16": np.int16, "F": np.float32}
+    nptype = mode_to_nptype.get(pic.mode, np.uint8)
+    img = np.asarray(pic, dtype=nptype)
+    if img.ndim == 2:
+        img = img[:, :, np.newaxis]
+    img = img.transpose((2, 0, 1))
+    t = torch.tensor(img.tolist(), dtype=torch.float32 if nptype == np.uint8 else None)
+    if nptype == np.uint8:
+        t = t.div_(255)
+    return t
+_TVF.to_tensor = _patched_to_tensor
 
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
@@ -56,6 +82,26 @@ TASK_SUITE_LABELS = {
     "libero_goal":    "Goal",
     "libero_10":      "Long",
 }
+
+
+def configure_runtime(device: str) -> None:
+    """Select the torch device and keep TensorFlow away from GPU memory."""
+    global DEVICE
+    DEVICE = torch.device(device)
+    if DEVICE.type == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"CUDA device requested but CUDA is unavailable: {device}")
+        torch.cuda.set_device(DEVICE)
+
+    try:
+        _tf.config.set_visible_devices([], "GPU")
+    except RuntimeError:
+        pass
+
+    # openvla_utils has its own module-level DEVICE; keep it in sync.
+    import experiments.robot.openvla_utils as openvla_utils
+    openvla_utils.DEVICE = DEVICE
+    print(f"[INFO] Torch device: {DEVICE}")
 
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -96,6 +142,22 @@ def load_vla(checkpoint: str, use_vision_action_head: bool, lora_rank: int = 32)
     processor = get_processor(cfg)
     action_head = get_action_head(cfg, vla.llm_dim)
 
+    # Monkey-patch _unnormalize_actions to use pure torch (bypass numpy ABI issues)
+    def _torch_unnormalize_actions(self, normalized_actions, unnorm_key):
+        action_norm_stats = self.get_action_stats(unnorm_key)
+        device = normalized_actions.device if hasattr(normalized_actions, 'device') else torch.device("cuda:0")
+        na = torch.tensor(normalized_actions.tolist(), dtype=torch.float32, device=device) if hasattr(normalized_actions, 'tolist') else torch.tensor(normalized_actions, dtype=torch.float32, device=device)
+        action_low = torch.as_tensor(list(action_norm_stats["q01"]), dtype=torch.float32, device=device)
+        action_high = torch.as_tensor(list(action_norm_stats["q99"]), dtype=torch.float32, device=device)
+        mask = torch.as_tensor(list(action_norm_stats.get("mask", [1]*len(action_low))), dtype=torch.bool, device=device)
+        actions = torch.where(
+            mask,
+            0.5 * (na + 1) * (action_high - action_low + 1e-8) + action_low,
+            na,
+        )
+        return actions
+    vla._unnormalize_actions = types.MethodType(_torch_unnormalize_actions, vla)
+
     return vla, action_head, processor, cfg
 
 
@@ -107,6 +169,8 @@ def collect_observations_with_labels(
     num_episodes: int = 5,
     num_frames: int = 60,
     seed: int = 42,
+    max_tasks: int = 5,
+    rollout_mode: str = "random",
 ) -> Dict[str, List[dict]]:
     """
     Collect observations together with ground-truth state labels.
@@ -125,11 +189,12 @@ def collect_observations_with_labels(
     )
     from experiments.robot.openvla_utils import resize_image_for_policy
 
-    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
     task_suite = benchmark.get_benchmark_dict()[task_suite_name]()
     all_data: Dict[str, List[dict]] = {}
 
-    for task_id in range(min(task_suite.n_tasks, 5)):
+    num_tasks = min(task_suite.n_tasks, max_tasks)
+    for task_id in range(num_tasks):
         task = task_suite.get_task(task_id)
         env, task_desc = get_libero_env(task, "openvla", resolution=256)
         init_states = task_suite.get_task_init_states(task_id)
@@ -138,6 +203,7 @@ def collect_observations_with_labels(
         for ep in range(min(num_episodes, len(init_states))):
             env.reset()
             obs = env.set_init_state(init_states[ep])
+            random_action = np.zeros(ACTION_DIM, dtype=np.float32)
 
             for step in range(num_frames):
                 if step < 10:
@@ -156,33 +222,18 @@ def collect_observations_with_labels(
                 robot_state_low = np.concatenate([eef_pos, eef_aa, gripper_qpos, gripper_open])  # (9,)
 
                 # ── high-level object state ──
-                # Retrieve movable object positions from MuJoCo simulation.
-                # We filter out bodies with zero name (fixed/static) and the robot base.
-                try:
-                    sim = env.sim
-                    body_names  = [sim.model.body_id2name(i) for i in range(sim.model.nbody)]
-                    body_xpos   = sim.data.body_xpos                           # (nbody, 3)
-                    object_positions = []
-                    for bname, bxpos in zip(body_names, body_xpos):
-                        if bname is None:
-                            continue
-                        bl = bname.lower()
-                        # Skip robot links, table, floor, worldbody, cameras
-                        if any(skip in bl for skip in [
-                            "robot", "table", "floor", "world", "camera",
-                            "gripper", "link", "mount", "base",
-                        ]):
-                            continue
-                        object_positions.append(bxpos)
-                    if len(object_positions) == 0:
-                        # Fallback: use full MuJoCo state (excluding robot proprio)
-                        full_state = sim.get_state().flatten()
-                        object_state_high = full_state  # will be filtered later
-                    else:
-                        object_state_high = np.concatenate(object_positions)  # (3*K,)
-                except Exception:
-                    # Fallback if sim access fails
-                    object_state_high = robot_state_low.copy()  # won't affect high-level probe much
+                # Direct object positions are cleaner than enumerating MuJoCo bodies,
+                # which also includes fixtures and duplicate child bodies.
+                object_pos_keys = sorted(
+                    key for key in obs
+                    if key.endswith("_pos") and not key.startswith("robot") and "_to_robot" not in key
+                )
+                if object_pos_keys:
+                    object_state_high = np.concatenate([obs[key] for key in object_pos_keys])
+                elif "object-state" in obs:
+                    object_state_high = np.asarray(obs["object-state"])
+                else:
+                    raise RuntimeError("LIBERO observation has no object position labels")
 
                 # ── goal progress (coarse: 0..1 normalised timestep) ──
                 # We use the ratio step / max_episode_length as a proxy for goal progress.
@@ -199,15 +250,30 @@ def collect_observations_with_labels(
                     "object_state_high": object_state_high,
                     "goal_progress":    goal_progress,
                     "task_label":       task_desc,
+                    "task_id":          task_id,
+                    "episode_id":       ep,
                     "timestep":         step,
                 })
 
-                obs, _, done, _ = env.step(get_libero_dummy_action("openvla"))
+                if rollout_mode == "random":
+                    target = rng.normal(0.0, 0.35, size=ACTION_DIM)
+                    target[3:6] *= 0.6
+                    random_action = np.clip(0.75 * random_action + 0.25 * target, -1.0, 1.0)
+                    random_action[-1] = -1.0 if ((step - 10) // 6) % 2 == 0 else 1.0
+                    action = random_action
+                else:
+                    action = get_libero_dummy_action("openvla")
+                obs, _, done, _ = env.step(action)
                 if done:
                     break
 
         all_data[task_desc] = frames
         env.close()
+        print(
+            f"  [COLLECT] Task {task_id + 1}/{num_tasks}: {task_desc} "
+            f"({len(frames)} frames)",
+            flush=True,
+        )
 
     return all_data
 
@@ -245,6 +311,7 @@ def extract_hidden_states(
     vla, action_head, processor, cfg,
     observations: List[dict],
     batch_size: int = 32,
+    unnorm_key: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Extract action-token hidden states from the VLA backbone for a list of observations.
@@ -298,7 +365,7 @@ def extract_hidden_states(
                     input_ids=input_ids,
                     pixel_values=pv,
                     attention_mask=torch.ones_like(input_ids),
-                    unnorm_key=None,
+                    unnorm_key=unnorm_key,
                     action_head=action_head,
                 )
             h = cap.hs  # (1, L, D)
@@ -347,13 +414,22 @@ def train_and_eval_probe(
     X_train_s = scaler.fit_transform(X_train)
     X_test_s  = scaler.transform(X_test)
 
+    # Exclude dimensions that are effectively constant in either split. Their
+    # R² denominator is near zero and used to dominate the mean with huge
+    # negative numerical artifacts (the original cause of the empty panel).
+    valid_dims = (y_train.std(axis=0) > 1e-5) & (y_test.std(axis=0) > 1e-5)
+    if not np.any(valid_dims):
+        raise ValueError("No target dimensions have enough variance for an R² probe")
+    y_train = y_train[:, valid_dims]
+    y_test = y_test[:, valid_dims]
+
     # Standardise targets too (makes multi-dimensional R² meaningful)
     y_mean = y_train.mean(axis=0, keepdims=True)
     y_std  = y_train.std(axis=0, keepdims=True) + 1e-8
     y_train_s = (y_train - y_mean) / y_std
     y_test_s  = (y_test  - y_mean) / y_std
 
-    probe = Ridge(alpha=1.0)
+    probe = Ridge(alpha=1.0, solver="lsqr")
     probe.fit(X_train_s, y_train_s)
 
     y_pred = probe.predict(X_test_s)
@@ -361,7 +437,9 @@ def train_and_eval_probe(
     ss_tot = np.sum((y_test_s - y_test_s.mean(axis=0, keepdims=True)) ** 2, axis=0)
     r2_per_dim = 1.0 - ss_res / (ss_tot + 1e-12)
 
-    return float(np.mean(r2_per_dim)), r2_per_dim  # average R² across target dimensions
+    full_r2 = np.full(valid_dims.shape, np.nan, dtype=np.float32)
+    full_r2[valid_dims] = r2_per_dim
+    return float(np.mean(r2_per_dim)), full_r2
 
 
 def run_probe_analysis(
@@ -373,6 +451,9 @@ def run_probe_analysis(
     lora_rank: int = 32,
     test_ratio: float = 0.3,
     seed: int = 42,
+    max_tasks: int = 5,
+    rollout_mode: str = "random",
+    split_mode: str = "frame",
 ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, any]]:
     """
     Run the full probe analysis for one task suite.
@@ -393,18 +474,24 @@ def run_probe_analysis(
     """
     # 1. Collect observations and labels
     print(f"[INFO] Collecting LIBERO observations ({task_suite_name}) ...")
-    all_obs = collect_observations_with_labels(task_suite_name, num_episodes, num_frames, seed)
+    all_obs = collect_observations_with_labels(
+        task_suite_name, num_episodes, num_frames, seed, max_tasks, rollout_mode
+    )
 
     # Flatten across tasks
     flat_obs = [frame for task_frames in all_obs.values() for frame in task_frames]
     print(f"  Total frames collected: {len(flat_obs)}")
+
+    # unnorm_key for action unnormalization (probe only needs hidden states, but
+    # predict_action requires it)
+    unnorm_key = f"{task_suite_name}_no_noops"
 
     # 2. Load Standard VLA and extract hidden states
     print(f"[INFO] Loading Standard VLA from {checkpoint_standard} ...")
     vla_std, ah_std, proc_std, cfg_std = load_vla(checkpoint_standard, use_vision_action_head=False, lora_rank=lora_rank)
     print("[INFO] Extracting hidden states (Standard VLA) ...")
     hs_std, robot_lbl, object_lbl, progress_lbl = extract_hidden_states(
-        vla_std, ah_std, proc_std, cfg_std, flat_obs
+        vla_std, ah_std, proc_std, cfg_std, flat_obs, unnorm_key=unnorm_key
     )
     del vla_std, ah_std  # free GPU memory
     torch.cuda.empty_cache()
@@ -414,7 +501,7 @@ def run_probe_analysis(
     vla_ours, ah_ours, proc_ours, cfg_ours = load_vla(checkpoint_ours, use_vision_action_head=True, lora_rank=lora_rank)
     print("[INFO] Extracting hidden states (CloudEdgeVLA) ...")
     hs_ours, _, _, _ = extract_hidden_states(
-        vla_ours, ah_ours, proc_ours, cfg_ours, flat_obs
+        vla_ours, ah_ours, proc_ours, cfg_ours, flat_obs, unnorm_key=unnorm_key
     )
     del vla_ours, ah_ours
     torch.cuda.empty_cache()
@@ -431,12 +518,30 @@ def run_probe_analysis(
                            "gripper_qpos_0", "gripper_qpos_1", "gripper_open"]
 
     # 5. Train/test split
-    np.random.seed(seed)
+    rng = np.random.default_rng(seed)
     N = len(flat_obs)
-    perm = np.random.permutation(N)
-    n_test = int(N * test_ratio)
-    test_idx  = perm[:n_test]
-    train_idx = perm[n_test:]
+    test_mask = np.zeros(N, dtype=bool)
+    if split_mode == "trajectory":
+        # Split whole trajectories, while retaining every task in both splits.
+        for task_id in sorted({frame["task_id"] for frame in flat_obs}):
+            episodes = sorted({
+                frame["episode_id"] for frame in flat_obs if frame["task_id"] == task_id
+            })
+            if len(episodes) < 2:
+                continue
+            episodes = list(rng.permutation(episodes))
+            n_test_eps = min(len(episodes) - 1, max(1, int(round(len(episodes) * test_ratio))))
+            selected = set(episodes[:n_test_eps])
+            for idx, frame in enumerate(flat_obs):
+                if frame["task_id"] == task_id and frame["episode_id"] in selected:
+                    test_mask[idx] = True
+    if split_mode == "frame" or not test_mask.any():
+        if split_mode == "trajectory":
+            print("[WARN] Only one trajectory per task; falling back to a frame-level split")
+        perm = rng.permutation(N)
+        test_mask[perm[:max(1, int(N * test_ratio))]] = True
+    test_idx = np.flatnonzero(test_mask)
+    train_idx = np.flatnonzero(~test_mask)
 
     print(f"[INFO] Train: {len(train_idx)}, Test: {len(test_idx)}")
 
@@ -496,9 +601,18 @@ def plot_probe_results(
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
     panel_labels = ["(a) High-Level Task State\n(Object positions + Goal progress)",
-                    "((b) Low-Level Robot State\n(Joint angles + Gripper + EEF position)"]
+                    "(b) Low-Level Robot State\n(EEF pose + Gripper state)"]
 
     colors = {"Standard VLA": "#94A3B8", "CloudEdgeVLA": "#2563EB"}
+    all_panel_values = [
+        all_results[suite][model][key]
+        for suite in suite_labels
+        for model in ("Standard VLA", "CloudEdgeVLA")
+        for key in ("high_level", "low_level")
+    ]
+    global_lower = min(0.0, min(all_panel_values))
+    global_upper = max(0.0, max(all_panel_values))
+    global_margin = max(0.08, 0.12 * max(global_upper - global_lower, 0.1))
 
     for panel_idx, (key, title) in enumerate(
         [("high_level", panel_labels[0]), ("low_level", panel_labels[1])]
@@ -528,13 +642,20 @@ def plot_probe_results(
         ax.set_xticklabels(suite_labels, fontsize=11)
         ax.set_ylabel("Probe R² Score", fontsize=12)
         ax.set_title(title, fontsize=12)
-        ax.set_ylim(0, max(1.05, ax.get_ylim()[1]))
-        ax.legend(fontsize=10, loc="upper right")
+        ax.set_ylim(global_lower - global_margin, global_upper + global_margin)
+        ax.axhline(0.0, color="#475569", linewidth=0.8)
         ax.grid(True, alpha=0.3, axis="y")
 
-    plt.tight_layout()
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, fontsize=10, loc="lower center", ncol=2,
+               bbox_to_anchor=(0.5, 0.01))
+    plt.tight_layout(rect=(0, 0.08, 1, 1))
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
     fig.savefig(output_path, dpi=200, bbox_inches="tight")
+    if Path(output_path).suffix.lower() != ".png":
+        png_path = str(Path(output_path).with_suffix(".png"))
+        fig.savefig(png_path, dpi=200, bbox_inches="tight")
+        print(f"[INFO] Saved → {png_path}")
     print(f"[INFO] Saved → {output_path}")
     plt.close(fig)
 
@@ -567,6 +688,10 @@ def save_raw_data(
             "lora_rank": args.lora_rank,
             "test_ratio": args.test_ratio,
             "seed": args.seed,
+            "max_tasks": args.max_tasks,
+            "rollout_mode": args.rollout_mode,
+            "device": args.device,
+            "split_mode": args.split_mode,
         },
         "suites": {},
     }
@@ -587,8 +712,19 @@ def save_raw_data(
         export["suites"][suite_label] = suite_data
 
     os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
+    def make_json_safe(value):
+        if isinstance(value, dict):
+            return {key: make_json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [make_json_safe(item) for item in value]
+        if isinstance(value, (float, np.floating)) and not np.isfinite(value):
+            return None
+        if hasattr(value, "tolist"):
+            return make_json_safe(value.tolist())
+        return value
+
     with open(json_path, "w") as f:
-        json.dump(export, f, indent=2, default=lambda o: o.tolist() if hasattr(o, "tolist") else str(o))
+        json.dump(make_json_safe(export), f, indent=2, allow_nan=False)
     print(f"[INFO] Raw data saved → {json_path}")
 
 
@@ -612,7 +748,14 @@ def main():
     parser.add_argument("--test_ratio", type=float, default=0.3)
     parser.add_argument("--output_path", type=str, default="results/fig5_probe.pdf")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--max_tasks", type=int, default=5)
+    parser.add_argument("--rollout_mode", choices=["random", "noop"], default="random")
+    parser.add_argument("--split_mode", choices=["frame", "trajectory"], default="frame")
+    parser.add_argument("--device", type=str,
+                        default="cuda:0" if torch.cuda.is_available() else "cpu")
     args = parser.parse_args()
+
+    configure_runtime(args.device)
 
     if args.task_suite_name == "all":
         all_results = {}
@@ -628,6 +771,9 @@ def main():
                 lora_rank=args.lora_rank,
                 test_ratio=args.test_ratio,
                 seed=args.seed,
+                max_tasks=args.max_tasks,
+                rollout_mode=args.rollout_mode,
+                split_mode=args.split_mode,
             )
             all_results[TASK_SUITE_LABELS[suite]] = results
             all_raw_info[TASK_SUITE_LABELS[suite]] = raw_info
@@ -643,6 +789,9 @@ def main():
             lora_rank=args.lora_rank,
             test_ratio=args.test_ratio,
             seed=args.seed,
+            max_tasks=args.max_tasks,
+            rollout_mode=args.rollout_mode,
+            split_mode=args.split_mode,
         )
         suite_label = TASK_SUITE_LABELS.get(args.task_suite_name, args.task_suite_name)
         all_results = {suite_label: results}

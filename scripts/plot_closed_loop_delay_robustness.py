@@ -6,7 +6,15 @@ also exported as strict JSON next to the generated PNG.
 
 import argparse
 import json
+import os
 from pathlib import Path
+
+# Some container images mount ~/.config with a host UID that differs from the
+# runtime user. Keep Matplotlib's writable cache inside the repository instead.
+_PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_MPL_CONFIG_DIR = _PROJECT_ROOT / ".cache" / "matplotlib"
+_MPL_CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+os.environ.setdefault("MPLCONFIGDIR", str(_MPL_CONFIG_DIR))
 
 import matplotlib
 
@@ -114,16 +122,21 @@ def plot(output_path: Path) -> dict:
         fontweight="bold",
         arrowprops={"arrowstyle": "-", "color": COLORS["CloudEdgeVLA"], "lw": 1.2},
     )
-    ax_curve.annotate(
-        "+91.2 pp",
-        xy=(41.2, SUCCESS_RATES["UniVLA"][-1]),
-        xytext=(41.2, cloudedge[-1]),
+    ax_curve.text(
+        28.0,
+        69.0,
+        "+91.2 pp at $d=40$\nvs. best baseline",
         ha="center",
         va="center",
-        rotation=90,
         color="#1E3A8A",
         fontweight="bold",
-        arrowprops={"arrowstyle": "<->", "color": "#1E3A8A", "lw": 1.4},
+        bbox={
+            "boxstyle": "round,pad=0.45",
+            "facecolor": "white",
+            "edgecolor": "#93C5FD",
+            "alpha": 0.92,
+        },
+        zorder=5,
     )
     ax_curve.set_title("(a) Closed-loop success under delay", loc="left", fontweight="bold")
     ax_curve.set_xlabel("Delay window $d$")
@@ -158,14 +171,15 @@ def plot(output_path: Path) -> dict:
         ax.grid(axis="x", color="#CBD5E1", alpha=0.55, lw=0.8)
         ax.set_axisbelow(True)
         for yi, value in zip(y, values):
+            label_inside = value >= 85.0
             ax.text(
-                min(value + 2.0, 101.5),
+                value - 3.0 if label_inside else value + 2.0,
                 yi,
                 f"{value:.1f}",
                 va="center",
-                ha="left" if value < 98 else "right",
+                ha="right" if label_inside else "left",
                 fontweight="bold" if yi == 0 else "normal",
-                color="#0F172A",
+                color="white" if label_inside else "#0F172A",
             )
 
     fig.suptitle(

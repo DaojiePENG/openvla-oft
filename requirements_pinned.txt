@@ -11,7 +11,7 @@ tensorflow-metadata==1.14.0 # 必须 1.14.x for protobuf 5.x compatibility
 # === PyTorch Stack ===
 torch==2.3.1
 torchvision==0.18.1
-torchaudio==2.11.0
+torchaudio==2.3.1         # 必须与 torch 2.3.1 使用同一版本系列
 
 # === Transformers ===
 transformers==4.40.1
@@ -20,6 +20,7 @@ huggingface-hub>=0.20.0
 # === Scientific Computing ===
 numpy==1.24.3
 scipy==1.11.4               # 必须 <1.14, 否则 ufunc compatibility error
+opencv-python==4.11.0.86    # OpenCV 5.x 要求 NumPy >=2，与训练栈冲突
 
 # === ML Libraries ===
 timm==0.9.10

@@ -87,7 +87,7 @@ class FinetuneConfig:
     # Training configuration
     batch_size: int = 8                              # Batch size per device (total batch size = batch_size * num GPUs)
     learning_rate: float = 5e-4                      # Learning rate
-    lr_warmup_steps: int = 0                         # Number of steps to warm up learning rate (from 10% to 100%)
+    lr_warmup_steps: int = 0                         # Steps to warm up learning rate from 0.1x to its configured value
     num_steps_before_decay: int = 100_000            # Number of steps before LR decays by 10x
     grad_accumulation_steps: int = 1                 # Number of gradient accumulation steps
     max_steps: int = 200_000                         # Max number of training steps
@@ -352,8 +352,14 @@ def run_forward_pass(
     """
     metrics = {}
 
-    # Get ground-truth action labels (current chunk only, discard future chunks)
-    ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)[:, :NUM_ACTIONS_CHUNK]
+    # RLDSBatchTransform must remove historical actions and return exactly the current action chunk.
+    ground_truth_actions = batch["actions"].to(device_id).to(torch.bfloat16)
+    expected_action_shape = (NUM_ACTIONS_CHUNK, ACTION_DIM)
+    if tuple(ground_truth_actions.shape[1:]) != expected_action_shape:
+        raise ValueError(
+            f"Expected batched action targets with trailing shape {expected_action_shape}, "
+            f"got {tuple(ground_truth_actions.shape)}."
+        )
 
     # [Only for diffusion] Sample noisy actions used as input for noise predictor network
     if use_diffusion:
@@ -451,13 +457,16 @@ def run_forward_pass(
             text_hidden = last_hidden[:, num_patches:-1]  # (B, text_len, D)
             batch_size = batch["input_ids"].shape[0]
             action_mask = current_action_mask | next_actions_mask  # (B, text_len)
-            selected = text_hidden[action_mask].to(torch.bfloat16)  # (num_total, D)
+            selected = text_hidden[action_mask].to(torch.bfloat16)  # (B * chunk_len * action_dim, D)
             hidden_dim = selected.shape[-1]
-            # selected: (B * total_action_tokens, D)
-            # total_action_tokens may include future chunks; take only current chunk (NUM_ACTIONS_CHUNK)
-            all_tokens = selected.reshape(batch_size, -1, hidden_dim)  # (B, total_chunks * ACTION_DIM, D)
-            current_chunk = all_tokens[:, :NUM_ACTIONS_CHUNK * ACTION_DIM]  # (B, NUM_ACTIONS_CHUNK * ACTION_DIM, D)
-            return current_chunk
+            expected_tokens_per_example = NUM_ACTIONS_CHUNK * ACTION_DIM
+            if selected.shape[0] != batch_size * expected_tokens_per_example:
+                raise ValueError(
+                    "Expected exactly one current action chunk in the token labels: "
+                    f"{expected_tokens_per_example} tokens per example, got "
+                    f"{selected.shape[0] // batch_size}."
+                )
+            return selected.reshape(batch_size, expected_tokens_per_example, hidden_dim)
 
         # Fresh hidden states from current frame (always available)
         h_fresh = extract_action_hidden_states(output_fresh)
@@ -875,6 +884,15 @@ def finetune(cfg: FinetuneConfig) -> None:
     assert not (cfg.use_l1_regression and cfg.use_diffusion), (
         "Cannot do both L1 regression and diffusion. Please pick one of them!"
     )
+    assert cfg.window_size >= 1, "window_size must be at least 1."
+    if cfg.use_frame_delay:
+        assert cfg.use_vision_action_head, "Frame-delay training requires VisionActionHead."
+        assert cfg.window_size >= 2, "Frame-delay training requires window_size >= 2."
+    if cfg.use_vision_action_head:
+        assert cfg.use_l1_regression, "VisionActionHead currently requires L1 regression."
+        assert cfg.action_head_num_views == cfg.num_images_in_input, (
+            "VisionActionHead num_views must match num_images_in_input."
+        )
 
     # Trim trailing forward slash ('/') in VLA path if it exists
     cfg.vla_path = cfg.vla_path.rstrip("/")

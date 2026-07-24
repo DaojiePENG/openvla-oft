@@ -1,7 +1,7 @@
 # Latency-Robust Vision-Language-Action Models via Cloud-Edge Collaborative Inference
 
 > Technical reference document for AAAI 2026 submission.
-> Last updated: 2026-07-05
+> Last updated: 2026-07-23
 
 ---
 
@@ -9,7 +9,7 @@
 
 Vision-Language-Action (VLA) models have emerged as powerful generalist robot policies by unifying high-level semantic reasoning with low-level motor control within a single large-scale backbone. However, deploying such models under realistic network conditions introduces a fundamental tension: the computationally intensive backbone that provides rich planning representations must typically run on a remote server with non-negligible latency, while the robot's local controller demands real-time responsiveness. Existing dual-system approaches attempt to address this through action-chunk re-planning or strictly synchronized fast-slow pipelines, but these solutions impose rigid temporal alignment constraints—requiring the fast system to operate at a fixed multiple of the slow system's frequency—and degrade gracefully only within narrow operating regimes.
 
-We propose a fundamentally different paradigm: a **latency-tolerant cloud-edge collaborative VLA framework** that eliminates the need for temporal alignment between the cloud and edge. Our key insight is that the two subsystems should learn **complementary and temporally asymmetric representations**: the cloud-side VLA backbone learns **time-invariant high-level representations** encoding task semantics, goals, and strategic trends (latency-insensitive), while the edge-side lightweight action head learns to **ground these high-level decisions into precise motor commands** using real-time local vision (latency-sensitive). This representational separation is achieved through a **paired-frame dual-path training strategy** that naturally encourages the backbone to discard timing-critical information and the action head to compensate with real-time visual features. Experiments on the LIBERO manipulation benchmark demonstrate that our approach achieves robust performance across a wide range of delay conditions while maintaining competitive synchronous performance, all without requiring any temporal alignment mechanism.
+We propose a fundamentally different paradigm: a **latency-tolerant cloud-edge collaborative VLA framework** that eliminates the need for temporal alignment between the cloud and edge. Our key insight is that the two subsystems should learn **complementary and temporally asymmetric representations**: the cloud-side VLA backbone learns **time-invariant high-level representations** encoding task semantics, goals, and strategic trends (latency-insensitive), while the edge-side lightweight action head learns to **ground these high-level decisions into precise motor commands** using real-time local vision (latency-sensitive). This representational separation is achieved through a **paired-frame dual-path training strategy** that naturally encourages the backbone to discard timing-critical information and the action head to compensate with real-time visual features. On LIBERO-Goal, CloudEdgeVLA reaches 96.0% success without delay and 94.2% at a 40-step delay (98.1% retention), while the strongest competing baseline reaches only 3.0% at the same delay. A matched-checkpoint diagnostic further shows 32.9% lower fresh–stale action drift than single-frame training at a 20-step delay, supporting the intended functional robustness of the learned fusion policy.
 
 ---
 
@@ -277,7 +277,7 @@ In contrast, our training procedure creates a **robust division of labor**: the 
 
 ## 4. Experiments
 
-> **Note**: The following describes our experimental setup. For the AAAI submission, results tables and figures will be added after training runs complete.
+The evidence below uses two complementary views of latency robustness. The closed-loop experiment measures the end-to-end outcome that matters for deployment: task success under delayed cloud features. The fresh–stale action-consistency diagnostic then isolates the policy interface by holding current edge vision fixed and changing only the age of the cloud planning feature. Together, they provide behavioral and functional evidence for the robustness targeted by dual-path training.
 
 ### 4.1 Implementation Framework
 
@@ -310,35 +310,80 @@ We compare against the following baselines:
 
 | Baseline | Description |
 |:--|:--|
-| **Standard VLA** | OpenVLA-OFT with single-frame training, evaluated without delay (upper bound). |
-| **Standard VLA + Delay** | OpenVLA-OFT with single-frame training, evaluated with network delay (lower bound). |
-| **Cloud-Edge (Ours)** | Our dual-system framework with VisionActionHead and paired-frame training. |
+| **OpenVLA** | The original OpenVLA policy evaluated under the same delayed-observation protocol. |
+| **OpenVLA-OFT** | The continuous-action OpenVLA-OFT policy trained without our paired-frame objective. |
+| **UniVLA** | A unified VLA baseline evaluated under the same delay-window settings. |
+| **CloudEdgeVLA (Ours)** | The VisionActionHead architecture trained with paired fresh/stale cloud features and current edge vision. |
 
 ### 4.4 Evaluation Conditions
 
-We evaluate under multiple delay conditions:
+For closed-loop evaluation, the edge image is always the current observation $o_t$, while the cloud planning feature is delayed by $d \in \{0,5,10,15,20,25,30,35,40\}$ environment steps. The training window is $W=21$, so $d \leq 20$ is within the sampled training support and $d \in \{25,30,35,40\}$ tests extrapolation beyond it. We report aggregate task success on LIBERO-Goal.
 
-- **No delay** ($k=0$): Synchronous inference, serves as the performance upper bound.
-- **Uniform delay** ($k \sim \text{Uniform}(1, d_{\max})$): Random delay per step, simulating variable network conditions.
-- **Fixed delay** ($k = d_{\max}$): Constant worst-case delay, simulating stable but slow networks.
+For action consistency, we use matched 20k checkpoints of the single-frame baseline and CloudEdgeVLA. Both models receive the same current edge feature $z_t$; only the cloud feature changes from $h_t$ to $h_{t-d}$. The diagnostic covers five LIBERO-Goal tasks, two sampled episodes, and up to 20 samples per task for each delay.
 
-We report task success rate (%) averaged over 50 trials per task, for $d_{\max} \in \{5, 10, 15\}$ environment steps.
+### 4.5 Closed-Loop Delay Robustness
 
-### 4.5 Ablation Studies
+![Closed-loop success and delay-retention summaries.](../results/fig_closed_loop_delay_robustness.png)
 
-We plan the following ablations:
+**Figure 1: Closed-loop robustness on LIBERO-Goal.** Panel (a) reports task success as cloud-feature delay increases. Panels (b–c) summarize the normalized area under the success-retention curve and the fraction of synchronous success retained at $d=40$. The shaded region $d>20$ lies beyond the delay range sampled during training. Generated by [`plot_closed_loop_delay_robustness.py`](../scripts/plot_closed_loop_delay_robustness.py); exact values are stored in [`fig_closed_loop_delay_robustness_data.json`](../results/fig_closed_loop_delay_robustness_data.json).
 
-1. **Vision encoder impact**: Compare frozen SigLIP-Base vs. SigLIP-SO400M vs. no vision (action head uses only stale planning features).
-2. **Window size**: Vary the training window size $W$ and measure robustness to delays beyond $W$.
-3. **Loss weighting**: Compare equal weighting ($\mathcal{L}_{\text{fresh}} + \mathcal{L}_{\text{stale}}$) vs. weighted variants.
-4. **Delay curriculum**: Compare uniform delay sampling vs. curriculum-based sampling (start with small delays, increase during training).
-5. **Representational analysis**: Probe the backbone's hidden states for delay-invariant vs. delay-sensitive information (see Section 3.7).
+| Model | $d=0$ | $d=5$ | $d=10$ | $d=15$ | $d=20$ | $d=25$ | $d=30$ | $d=35$ | $d=40$ |
+|:--|--:|--:|--:|--:|--:|--:|--:|--:|--:|
+| OpenVLA | 77.0 | 36.2 | 2.2 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 | 0.0 |
+| OpenVLA-OFT | **97.2** | 76.2 | 26.2 | 15.2 | 4.0 | 2.4 | 0.0 | 0.0 | 0.0 |
+| UniVLA | 94.6 | 87.8 | 48.2 | 31.4 | 21.8 | 16.0 | 11.8 | 6.6 | 3.0 |
+| **CloudEdgeVLA** | 96.0 | **95.4** | **95.4** | **94.8** | **94.6** | **94.4** | **94.4** | **94.2** | **94.2** |
 
-### 4.6 Metrics
+CloudEdgeVLA preserves synchronous quality while changing the delay-failure profile:
 
-- **Task Success Rate (%)**: Primary metric. Fraction of 50 evaluation trials that complete successfully.
-- **Action L1 Error**: Mean L1 distance between predicted and ground-truth actions, reported separately for fresh and stale paths during training.
-- **Delay Robustness Curve**: Success rate as a function of delay $k$, showing graceful degradation.
+- **Competitive synchronous performance:** at $d=0$, CloudEdgeVLA obtains 96.0%, within 1.2 percentage points of the strongest synchronous result (OpenVLA-OFT at 97.2%).
+- **Severe-delay robustness:** at $d=40$, CloudEdgeVLA reaches 94.2%, exceeding the best baseline (UniVLA at 3.0%) by **91.2 percentage points**.
+- **Near-flat retention:** success falls by only 1.8 points from $d=0$ to $d=40$, retaining **98.1%** of synchronous success. Its normalized delay AURC is **98.7%**, compared with 36.0% for UniVLA, 22.2% for OpenVLA-OFT, and 12.5% for OpenVLA.
+- **Out-of-window generalization:** performance changes from 94.6% at the largest trained delay ($d=20$) to 94.2% at $d=40$. This result supports robustness beyond the sampled training window rather than memorization of the training delay range.
+
+The aggregate success rates currently provide no per-seed uncertainty, so this figure is used as effect-size evidence; confidence intervals should be added when repeated-seed evaluations are available.
+
+### 4.6 Fresh–Stale Action Consistency
+
+To directly test the property induced by the dual-path objective, we measure
+
+$$D(d)=\mathbb{E}\left[\left|g_\phi(h_t,z_t)-g_\phi(h_{t-d},z_t)\right|\right],$$
+
+where actions are compared in normalized action space. Because $z_t$ is fixed, a lower $D(d)$ means that replacing a fresh cloud representation with a stale one causes a smaller action change; lower is better.
+
+![Fresh–stale action consistency for matched checkpoints.](../results/fig_action_consistency_latest.png)
+
+**Figure 2: Fresh–stale action consistency on LIBERO-Goal.** Both curves use matched 20k checkpoints and identical observations. Panel (a) shows mean normalized action drift with one-standard-deviation bands; panel (b) shows the sample distribution at $d=20$. Generated by [`visualize_fresh_stale_action_consistency.py`](../scripts/visualize_fresh_stale_action_consistency.py); summary statistics and per-sample values are stored in [`fig_action_consistency_latest_data.json`](../results/fig_action_consistency_latest_data.json).
+
+| Delay $d$ | Single-frame drift | CloudEdgeVLA drift | Relative reduction |
+|--:|--:|--:|--:|
+| 1 | 0.0201 | **0.0141** | 30.1% |
+| 5 | 0.0577 | **0.0377** | 34.7% |
+| 10 | 0.0801 | **0.0548** | 31.6% |
+| 15 | 0.0946 | **0.0642** | 32.1% |
+| 20 | 0.1048 | **0.0704** | 32.9% |
+
+CloudEdgeVLA has lower drift at every nonzero tested delay. At the maximum trained delay, its mean drift is 0.0704 versus 0.1048 for single-frame training, a **32.9% reduction**. This controlled comparison provides functional evidence for the paper's central mechanism: paired-frame training makes the action output less sensitive to cloud-feature age when real-time edge vision is unchanged. It does not, by itself, identify which hidden dimensions encode semantic or timing information; the claim supported here is output-level compensation rather than internal feature attribution.
+
+Because this diagnostic uses matched 20k checkpoints and a limited trajectory sample, it is treated as mechanistic supporting evidence. The camera-ready analysis should rerun the same protocol on the final matched checkpoints without changing the metric or sampling procedure.
+
+### 4.7 Remaining Ablation Studies
+
+The following architectural and training ablations remain useful complements to the two primary results:
+
+1. **Vision encoder impact:** Compare frozen SigLIP-Base vs. SigLIP-SO400M vs. no edge vision.
+2. **Window size:** Vary $W$ and measure robustness beyond each corresponding training-delay support.
+3. **Loss weighting:** Compare equal weighting ($\mathcal{L}_{\text{fresh}} + \mathcal{L}_{\text{stale}}$) with weighted variants.
+4. **Delay curriculum:** Compare uniform delay sampling with a small-to-large delay curriculum.
+
+The paper grounds its central empirical claims in closed-loop success and the controlled action-consistency intervention above.
+
+### 4.8 Metrics
+
+- **Task Success Rate (%):** Primary closed-loop metric.
+- **Normalized delay AURC (%):** Trapezoidal area under $S(d)/S(0)$, normalized by the evaluated delay interval.
+- **Success Retention at $d=40$ (%):** $100\,S(40)/S(0)$.
+- **Fresh–Stale Action Drift:** Mean absolute difference between actions obtained with fresh and delayed cloud features while holding current edge vision fixed.
 
 ---
 

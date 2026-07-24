@@ -1,4 +1,6 @@
 #!/bin/bash
+set -euo pipefail
+
 # ==============================================================================
 # Local Training: Frame Delay + VisionActionHead for async deployment
 #
@@ -83,10 +85,16 @@ echo ${LOG_PID} > logs/train_${RUN_ID}_${LOG_PID}.pid
 exec > logs/train_${RUN_ID}_${LOG_PID}.log 2> logs/train_${RUN_ID}_${LOG_PID}.err
 
 # Training configuration
+# Fresh training must start from the clean OFT base, not any checkpoint produced by the old windowed pipeline.
 VLA_PATH="/home/sheng/workspace/openvla-7b-oft-finetuned-libero-spatial-object-goal-10"
 DATA_ROOT_DIR="/home/sheng/workspace/modified_libero_rlds"
 DATASET_NAME="libero_goal_no_noops"
 RUN_ROOT_DIR="/home/sheng/workspace/openvla-oft/runs"
+
+if [[ "$VLA_PATH" == "$RUN_ROOT_DIR/"* ]]; then
+    echo "ERROR: Fresh frame-delay training cannot start from an existing run checkpoint: $VLA_PATH"
+    exit 1
+fi
 
 # VisionActionHead Configuration
 USE_VISION_ACTION_HEAD=true
@@ -104,14 +112,14 @@ WINDOW_SIZE=21
 # λ linearly ramps from 0 → STALE_LOSS_LAMBDA_MAX over WARMUP steps, then holds.
 # Set WARMUP to -1 for auto (= max_steps/2).
 STALE_LOSS_LAMBDA_MAX=0.5
-STALE_LOSS_WARMUP_STEPS=-1
+STALE_LOSS_WARMUP_STEPS=80000
 
 # Training hyperparameters
 BATCH_SIZE=4                    # Halved from 8: frame_delay does 2 sequential forwards, each uses half the memory
 GRAD_ACCUM_STEPS=1              # Effective batch = 4 * 1 * 2gpus = 8 (same as before)
 LEARNING_RATE=0.0005
 LORA_RANK=16
-MAX_STEPS=250000
+MAX_STEPS=200000
 NUM_STEPS_BEFORE_DECAY=100000
 SAVE_FREQ=10000
 NUM_IMAGES=2
@@ -135,6 +143,7 @@ echo "Vision Encoder: ${ACTION_HEAD_VISION_ENCODER}"
 echo "Num Views: ${ACTION_HEAD_NUM_VIEWS}"
 echo "Frame Delay: ${USE_FRAME_DELAY}"
 echo "Window Size: ${WINDOW_SIZE}"
+echo "Action Target: current step + 7 future steps"
 echo "Stale Loss λ_max: ${STALE_LOSS_LAMBDA_MAX}"
 echo "Stale Loss Warmup: ${STALE_LOSS_WARMUP_STEPS} (-1 = auto)"
 echo "============================================================"
@@ -165,7 +174,7 @@ torchrun --nproc_per_node=${NUM_GPUS} --master_port=${MASTER_PORT} vla-scripts/f
     --save_latest_checkpoint_only false \
     --wandb_entity "pengdaojie-the-hong-kong-university-of-science-and-techn" \
     --wandb_project "openvla-frame-delay" \
-    --run_id_note "frame_delay_w${WINDOW_SIZE}_visionAH" \
+    --run_id_note "frame_delay_w${WINDOW_SIZE}_visionAH_aligned" \
     --use_vision_action_head ${USE_VISION_ACTION_HEAD} \
     --action_head_vision_encoder ${ACTION_HEAD_VISION_ENCODER} \
     --freeze_action_head_vision ${FREEZE_ACTION_HEAD_VISION} \

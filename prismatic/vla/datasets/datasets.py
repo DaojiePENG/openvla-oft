@@ -36,20 +36,28 @@ class RLDSBatchTransform:
 
     def __call__(self, rlds_batch: Dict[str, Any]) -> Dict[str, Any]:
         """Converts a RLDS batch to the format expected by the OpenVLA collator/models."""
-        dataset_name, current_action = rlds_batch["dataset_name"], rlds_batch["action"][0]
+        dataset_name = rlds_batch["dataset_name"]
         # With window_size=1, image_primary shape is (1, H, W, C); [0] is the current frame.
         # With window_size>1, image_primary shape is (window_size, H, W, C);
         #   index -1 is the current frame, indices 0..-2 are past frames.
         all_window_frames = rlds_batch["observation"]["image_primary"]
         img = Image.fromarray(all_window_frames[-1])  # current frame is always the last in window
         lang = rlds_batch["task"]["language_instruction"].decode().lower()
-        actions = rlds_batch["action"]
+        # chunk_act_obs prepends historical actions before the current action and its future chunk.
+        # Keep only [current, future...] so every training input and target uses the same timestep t.
+        all_window_actions = rlds_batch["action"]
+        if all_window_actions.shape[0] < NUM_ACTIONS_CHUNK:
+            raise ValueError(
+                f"Expected at least {NUM_ACTIONS_CHUNK} actions, got shape {all_window_actions.shape}."
+            )
+        actions = all_window_actions[-NUM_ACTIONS_CHUNK:]
+        current_action = actions[0]
 
         # Construct Chat-based Prompt =>> Input is default query + language instruction, output are the action tokens
         prompt_builder = self.prompt_builder_fn("openvla")
 
         # Get future action chunk
-        future_actions = rlds_batch["action"][1:]
+        future_actions = actions[1:]
         future_actions_string = ''.join(self.action_tokenizer(future_actions))
 
         # Get action chunk string

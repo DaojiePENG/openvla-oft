@@ -11,6 +11,8 @@ import numpy as np
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
+from prismatic.vla.constants import ACTION_DIM, NUM_ACTIONS_CHUNK
+
 # HuggingFace Default / LLaMa-2 IGNORE_INDEX (for labels)
 IGNORE_INDEX = -100
 
@@ -131,6 +133,15 @@ class PaddedCollatorForActionPrediction:
                 pixel_values = torch.stack(pixel_values)
         else:
             raise ValueError(f"Unsupported `pixel_values` type = {type(pixel_values)}")
+
+        # Historical actions must already be removed by RLDSBatchTransform.
+        expected_action_shape = (NUM_ACTIONS_CHUNK, ACTION_DIM)
+        for instance in instances:
+            if instance["actions"].shape != expected_action_shape:
+                raise ValueError(
+                    "Expected each action target to contain only the current action chunk with shape "
+                    f"{expected_action_shape}, got {instance['actions'].shape}."
+                )
 
         # Stack all actions
         actions = [torch.from_numpy(np.copy(instance["actions"])) for instance in instances]

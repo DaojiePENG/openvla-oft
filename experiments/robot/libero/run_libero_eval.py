@@ -31,6 +31,7 @@ from experiments.robot.libero.libero_utils import (
     quat2axisangle,
     save_rollout_video,
 )
+from experiments.robot.frame_delay import FrameDelayHistory
 from experiments.robot.openvla_utils import (
     get_action_head,
     get_noisy_action_projector,
@@ -149,6 +150,15 @@ def validate_config(cfg: GenerateConfig) -> None:
         assert cfg.center_crop, "Expecting `center_crop==True` because model was trained with image augmentations!"
 
     assert not (cfg.load_in_8bit and cfg.load_in_4bit), "Cannot use both 8-bit and 4-bit quantization!"
+
+    if cfg.use_frame_delay_eval:
+        assert cfg.use_vision_action_head, "Frame-delay evaluation requires VisionActionHead."
+        assert cfg.max_delay_steps_eval >= 1, "Frame-delay evaluation requires max_delay_steps_eval >= 1."
+    if cfg.use_vision_action_head:
+        assert cfg.use_l1_regression, "VisionActionHead currently requires L1 regression."
+        assert cfg.action_head_num_views == cfg.num_images_in_input, (
+            "VisionActionHead num_views must match num_images_in_input."
+        )
 
     # Validate task suite
     assert cfg.task_suite_name in [suite.value for suite in TaskSuite], f"Invalid task suite: {cfg.task_suite_name}"
@@ -316,9 +326,9 @@ def run_episode(
                "both speed and success rate), we recommend executing the full action chunk.")
     action_queue = deque(maxlen=cfg.num_open_loop_steps)
 
-    # Frame delay eval: maintain history of pixel_values for delay simulation
+    # Frame delay eval: maintain one image entry per environment step.
     use_frame_delay = cfg.use_frame_delay_eval and cfg.use_vision_action_head
-    frame_pv_history = deque(maxlen=cfg.max_delay_steps_eval + 1) if use_frame_delay else None
+    frame_history = FrameDelayHistory(cfg.max_delay_steps_eval) if use_frame_delay else None
 
     # Setup
     t = 0
@@ -339,25 +349,24 @@ def run_episode(
             observation, img = prepare_observation(obs, resize_size)
             replay_images.append(img)
 
+            if use_frame_delay:
+                current_images = [observation["full_image"]]
+                if cfg.num_images_in_input > 1:
+                    current_images.extend([observation[k] for k in observation.keys() if "wrist" in k])
+                frame_history.append(current_images)
+
             # If action queue is empty, requery model
             if len(action_queue) == 0:
                 if use_frame_delay:
                     # --- Frame delay eval: VLA processes delayed frame, action head gets current frame ---
-                    # Collect all images from current observation
-                    all_images = [observation["full_image"]]
-                    if cfg.num_images_in_input > 1:
-                        all_images.extend([observation[k] for k in observation.keys() if "wrist" in k])
+                    current_pv = get_pixel_values_from_images(frame_history.current, cfg, processor, task_description)
 
-                    # Process current frame into pixel_values and store in history
-                    current_pv = get_pixel_values_from_images(all_images, cfg, processor, task_description)
-                    frame_pv_history.append(current_pv)
-
-                    if len(frame_pv_history) > 1:
-                        # Sample a random delayed pixel_values from history
-                        max_delay = min(cfg.max_delay_steps_eval, len(frame_pv_history) - 1)
-                        delay_k = np.random.randint(1, max_delay + 1)
-                        delayed_pv_idx = max(0, len(frame_pv_history) - 1 - delay_k)
-                        delayed_pv = frame_pv_history[delayed_pv_idx]
+                    delayed_images, _ = frame_history.sample_delayed(np.random)
+                    if delayed_images is not None:
+                        # Sample a past environment step, matching the training window semantics.
+                        delayed_pv = get_pixel_values_from_images(
+                            delayed_images, cfg, processor, task_description
+                        )
 
                         # VLA uses delayed frame, action head uses current frame
                         actions = get_action(
